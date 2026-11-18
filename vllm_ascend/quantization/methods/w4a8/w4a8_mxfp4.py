@@ -465,16 +465,15 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
 
     def _use_grouped_situ(self, mlp_compute_input: MoEMlpComputeInput) -> bool:
         return (
-            mlp_compute_input.activation == MoEActivation.SITU
+            get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+            and mlp_compute_input.activation == MoEActivation.SITU
             and mlp_compute_input.group_list_type in (0, 1)
             and self.group_size == 32
             and not self.use_expert_weight_list
             and mlp_compute_input.lora_context is None
-            and mlp_compute_input.hidden_states.shape[0] > 0
             and (mlp_compute_input.activation_situ_beta is None or mlp_compute_input.activation_situ_beta > 0)
             and (mlp_compute_input.activation_situ_linear_beta or 0.0) > 0
             and hasattr(torch.ops.custom, "grouped_situ_mx_quant")
-            and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
         )
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
@@ -485,6 +484,10 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         assert layer is not None
         if (
             not use_grouped_situ
+            # A5 SiTU keeps PR35's separate GMM1 + activation/quant path
+            # even when the optional grouped SiTU operator is unavailable.
+            and not get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+            and mlp_compute_input.shared_expert_schedule is None
             and mlp_compute_input.activation == MoEActivation.SITU
             and mlp_compute_input.group_list_type in (0, 1)
             and self.group_size == 32
@@ -529,13 +532,12 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             output_dtype=torch.bfloat16,
         )[0]
         dispose_tensor(mlp_compute_input.hidden_states)
+        if mlp_compute_input.shared_expert_schedule is not None:
+            mlp_compute_input.shared_expert_schedule.after_gmm1()
         if use_grouped_situ:
-            expert_tokens = cumsum_group_list(
-                mlp_compute_input.group_list.to(torch.int64), mlp_compute_input.group_list_type, 1
-            )
             activated, scale = torch.ops.custom.grouped_situ_mx_quant(
                 hidden_states,
-                expert_tokens,
+                cumsum_group_list(mlp_compute_input.group_list.to(torch.int64), mlp_compute_input.group_list_type, 1),
                 beta=1.0 if mlp_compute_input.activation_situ_beta is None else mlp_compute_input.activation_situ_beta,
                 alpha=mlp_compute_input.activation_situ_linear_beta,
                 high_precision=False,
