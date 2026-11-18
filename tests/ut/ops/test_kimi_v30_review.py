@@ -2,6 +2,7 @@
 """CPU regressions for storage, serial execution and caller input contracts."""
 
 import ast
+import hashlib
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -278,6 +279,291 @@ class TestKimiMigrationReview(unittest.TestCase):
                 setattr(obj, attribute, old)
             runner.routed_input_transform.quant_method.quant_method = object()
             self.assertFalse(runner._can_run_kimi_decode(x))
+
+
+NATIVE_F89_METHOD_HASHES = (
+    ("AscendKimiDecoderLayer", "forward", "8f6e678b1ac8bbd0dd4b6e988890bcec41bf7004db173475ffde5ac94a8fce82"),
+    (
+        "AscendKimiDecoderLayer",
+        "prepare_attn_residual",
+        "ac3d38df6a9f1c0e681e13f2369d82060a8a4accdb1f0fea52e627d1286fc239",
+    ),
+    (
+        "AscendKimiDecoderLayer",
+        "forward_attn_residual",
+        "10e88407699f1fe63b142f79a75ee3b414165933c7db3eeeb8a6e79137f63eb4",
+    ),
+    ("AscendKimiLinearModel", "__init__", "403bff0349be27c8a19ec723625019770e810830c7d43db1744f733554b43d63"),
+    ("AscendKimiLinearModel", "load_weights", "ab16d00c4233c4ff5ef007d3b5e5f862d088de14e1fd735ef9446a186c04e5e5"),
+    ("AscendKimiLinearModel", "forward", "2d0856dc1f8eb03076da728f22611c05ea1c45078840eeb4444a31f901a96d8d"),
+)
+
+
+class TestKimiNativeResidual(unittest.TestCase):
+    def test_native_methods_match_frozen_f89_ast(self):
+        # Frozen from f89e5592d6fbcb36ee8ce0e538d23f0dd8f951b8. Empty
+        # type_params fields are ignored for Python 3.11/3.13 AST parity.
+        expected = NATIVE_F89_METHOD_HASHES
+        tree = ast.parse((ROOT / "vllm_ascend/models/kimi_k3.py").read_text())
+        for owner, name, digest in expected:
+            cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner)
+            fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            for node in ast.walk(fn):
+                node._fields = tuple(field for field in node._fields if field != "type_params")
+            actual = hashlib.sha256(ast.dump(fn, include_attributes=False).encode()).hexdigest()
+            self.assertEqual(actual, digest, f"{owner}.{name}")
+
+    def test_removed_backend_and_compile_state_are_absent(self):
+        model = (ROOT / "vllm_ascend/models/kimi_k3.py").read_text()
+        for name in (
+            "support_torch_compile",
+            "AttnResBackend",
+            "AttnResQueryPlan",
+            "load_attn_res_fused_ops",
+            "resolve_attn_res_mode",
+            "attn_res_mode",
+            "attn_res_query_plan",
+            "attn_res_fused_ops",
+            "attn_res_op",
+            "VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED",
+        ):
+            self.assertNotIn(name, model)
+        tree = ast.parse(model)
+        self.assertFalse(
+            any(
+                (isinstance(node, ast.ImportFrom) and node.module == "vllm_ascend.ops.kimi_attn_res")
+                or (
+                    isinstance(node, ast.Import)
+                    and any(alias.name == "vllm_ascend.ops.kimi_attn_res" for alias in node.names)
+                )
+                for node in ast.walk(tree)
+            )
+        )
+        self.assertIn("torch.ops._C_ascend.attn_res_fwd", model)
+
+    def test_native_prepare_preserves_operator_arguments_and_write_flags(self):
+        for write in (False, True):
+            op = Mock(return_value=(object(), object(), object()))
+            ns = dict(torch=NS(ops=NS(_C_ascend=NS(attn_res_fwd=op))))
+            cls = load_class("vllm_ascend/models/kimi_k3.py", "AscendKimiDecoderLayer", {"prepare_attn_residual"}, ns)
+            layer = cls()
+            layer.self_attention_res_proj = NS(weight=object())
+            layer.self_attention_res_norm = NS(weight=object(), variance_epsilon=1e-6)
+            layer.input_layernorm = NS(weight=object(), variance_epsilon=1e-5)
+            layer.prev_valid_blocks, layer.block_write_idx, layer.is_block_write_layer = 3, 3, write
+            prefix, addend, bank = object(), object(), object()
+            result = layer.prepare_attn_residual(prefix, bank, addend, return_materialized=True, optimize_prefill=True)
+            self.assertIs(result, op.return_value)
+            args = op.call_args.args
+            for actual, expected in zip(
+                args[:5],
+                (prefix, addend, bank, layer.self_attention_res_proj.weight, layer.self_attention_res_norm.weight),
+            ):
+                self.assertIs(actual, expected)
+            self.assertEqual(args[5:7], (1e-6, 3))
+            self.assertIs(args[7], layer.input_layernorm.weight)
+            self.assertEqual(args[8:], (1e-5, 3 if write else -1, True))
+            self.assertEqual(op.call_args.kwargs, {"optimize_prefill": True})
+
+    def test_native_decoder_preserves_deferred_and_completed_mlp_add(self):
+        for write in (False, True):
+            for deferred in (False, True):
+                with self.subTest(write=write, deferred=deferred):
+
+                    def native(prefix, addend, *args, **kwargs):
+                        if kwargs.get("mix") is False:
+                            return prefix + addend, prefix + addend, None
+                        return torch.full((2, 1), 4.0), torch.full((2, 1), 9.0), None
+
+                    op = Mock(side_effect=native)
+                    cls = load_class(
+                        "vllm_ascend/models/kimi_k3.py",
+                        "AscendKimiDecoderLayer",
+                        {"forward_attn_residual"},
+                        dict(torch=NS(ops=NS(_C_ascend=NS(attn_res_fwd=op)))),
+                    )
+                    layer = cls()
+                    layer.is_block_write_layer, layer.use_sequence_parallel, layer.prev_valid_blocks = write, False, 3
+                    layer.self_attn = lambda **kwargs: torch.full((2, 1), 2.0)
+                    layer.mlp = lambda x: x + 3
+                    layer.mlp_res_proj = NS(weight=object())
+                    layer.mlp_res_norm = NS(weight=object(), variance_epsilon=1e-6)
+                    layer.post_attention_layernorm = NS(weight=object(), variance_epsilon=1e-5)
+                    prefix, bank = torch.full((2, 1), 7.0), torch.zeros(2, 4, 1)
+                    result = layer.forward_attn_residual(
+                        torch.arange(2),
+                        prefix,
+                        bank,
+                        prepared_attn_input=(prefix, prefix, None),
+                        defer_mlp_add=deferred,
+                        optimize_prefill=True,
+                    )
+                    self.assertIs(result[1], bank)
+                    self.assertEqual(op.call_count, 1 if deferred else 2)
+                    first = op.call_args_list[0]
+                    self.assertEqual(first.args[6], 3 + int(write))
+                    self.assertEqual(first.kwargs, {"optimize_prefill": True})
+                    if write:
+                        self.assertIsNone(first.args[1])
+                    else:
+                        self.assertIs(first.args[0], prefix)
+                    torch.testing.assert_close(result[0], torch.full((2, 1), 9.0 if deferred else 16.0))
+                    if deferred:
+                        torch.testing.assert_close(result[2], torch.full((2, 1), 7.0))
+                    else:
+                        self.assertEqual(op.call_args.kwargs, {"mix": False, "optimize_prefill": True})
+
+    def test_native_model_preserves_pp_and_dspark_state_boundaries(self):
+        for first in (False, True):
+            for last in (False, True):
+                for materialized in (False, True):
+                    with self.subTest(first=first, last=last, materialized=materialized):
+                        state = NS(is_first_rank=first, is_last_rank=last)
+                        base_value = 1.0 if first else 7.0
+                        incoming_bank = torch.full((2, 1, 1), 5.0)
+                        prepared = []
+
+                        class Layer:
+                            def prepare_attn_residual(self, prefix, bank, addend, _prepared=prepared, **kwargs):
+                                _prepared.append((bank, addend, kwargs))
+                                return prefix + 100, prefix, prefix + 100
+
+                            def __call__(self, **kwargs):
+                                self_input = kwargs["prepared_attn_input"][1]
+                                return self_input + 10, kwargs["residual"], torch.full_like(self_input, 3)
+
+                        def native(prefix, addend, bank, *args, **kwargs):
+                            raw = prefix + addend
+                            return raw + 1000, raw, raw + 1000
+
+                        op = Mock(side_effect=native)
+                        ns = dict(
+                            torch=NS(ops=NS(_C_ascend=NS(attn_res_fwd=op))),
+                            get_pp_group=lambda _state=state: _state,
+                            PPTransportDataType=NS(AUX_HIDDEN_STATES="aux"),
+                            get_pp_transport_tensors=lambda tensors, key: (
+                                [] if tensors is None else list(tensors["aux"])
+                            ),
+                            add_pp_transport_tensors=lambda tensors, key, aux: dict(tensors, aux=aux),
+                            IntermediateTensors=dict,
+                            cdiv=lambda a, b: (a + b - 1) // b,
+                            _use_attn_res_prefill_cache=lambda: True,
+                        )
+                        cls = load_class("vllm_ascend/models/kimi_k3.py", "AscendKimiLinearModel", {"forward"}, ns)
+                        model = cls()
+                        model.config = NS(attn_res_block_size=1)
+                        model.start_layer, model.end_layer = (0, 1) if first else (1, 2)
+                        model.layers = [Layer()] if first else [None, Layer()]
+                        model.use_sequence_parallel = False
+                        model.dspark_aux_capture_materialized = materialized
+                        model.aux_hidden_state_layers = {model.start_layer, model.end_layer}
+                        model.output_attn_res_proj = NS(weight=object())
+                        model.output_attn_res_norm = NS(weight=object(), variance_epsilon=1e-6)
+                        model._maybe_add_hidden_state = lambda aux, index, x, residual: aux.append(x.clone()) or aux
+                        incoming = (
+                            None
+                            if first
+                            else {
+                                "hidden_states": torch.full((2, 1), base_value),
+                                "residual": incoming_bank,
+                                "aux": [torch.full((2, 1), 9.0)],
+                            }
+                        )
+                        result = model.forward(None, torch.arange(2), incoming, torch.full((2, 1), base_value))
+                        bank, addend, flags = prepared[0]
+                        self.assertIsNone(addend)
+                        self.assertEqual(flags, {"return_materialized": materialized, "optimize_prefill": True})
+                        self.assertEqual(bank.shape, (2, model.end_layer, 1))
+                        if not first:
+                            torch.testing.assert_close(bank[:, :1], incoming_bank)
+                        if last:
+                            output, aux = result
+                            torch.testing.assert_close(output, torch.full((2, 1), base_value + 1013))
+                            self.assertEqual(op.call_args.args[6], model.end_layer)
+                            self.assertEqual(op.call_args.kwargs, {"optimize_prefill": True})
+                        else:
+                            aux = result["aux"]
+                            torch.testing.assert_close(result["hidden_states"], torch.full((2, 1), base_value + 13))
+                            self.assertIs(result["residual"], bank)
+                            op.assert_not_called()
+                        expected_aux = [] if first else [9.0]
+                        if materialized:
+                            expected_aux.append(base_value + 100)
+                            if last:
+                                expected_aux.append(base_value + 1013)
+                        else:
+                            if first:
+                                expected_aux.append(base_value)
+                            expected_aux.append(base_value + 13)
+                        self.assertEqual(len(aux), len(expected_aux))
+                        for actual, expected in zip(aux, expected_aux):
+                            torch.testing.assert_close(actual, torch.full((2, 1), expected))
+
+    def test_native_reload_keeps_gate_mapping_without_derived_state(self):
+        class Base:
+            def load_weights(self, weights):
+                self.loaded = list(weights)
+                return {args[0] for args in self.loaded}
+
+        eplb = Mock(side_effect=lambda model, weights, redundant: list(weights))
+        cls = load_class(
+            "vllm_ascend/models/kimi_k3.py",
+            "AscendKimiLinearModel",
+            {"load_weights"},
+            dict(Base=Base, load_eplb_expert_weights=eplb),
+            "Base",
+        )
+        model = cls()
+        prefix = "layers.0.attn."
+        targets = [
+            prefix + "fused_bfg_proj.weight",
+            prefix + "fused_bfg_proj.f_a_weight",
+            prefix + "fused_bfg_proj.f_b_weight",
+        ]
+        model.named_parameters = lambda: [(name, object()) for name in targets]
+        model.n_redundant_experts = 2
+        for value in (1.0, 2.0):
+            sources = [prefix + name + ".weight" for name in ("b_proj", "f_a_proj", "f_b_proj", "g_proj")]
+            tensors = [torch.tensor([value]) for name in sources]
+            weights = [(name, tensor, {"tag": "checkpoint"}) for name, tensor in zip(sources, tensors)]
+            result = model.load_weights(weights)
+            self.assertEqual(result, set(targets))
+            for index, args in enumerate(model.loaded):
+                self.assertIs(args[1], tensors[index])
+                self.assertEqual(args[2], {"tag": "checkpoint", "loaded_shard_id": (0, None, None, 2)[index]})
+            self.assertTrue(all(args[2] == {"tag": "checkpoint"} for args in weights))
+            self.assertEqual(eplb.call_args.args[2], 2)
+            self.assertEqual(set(model.__dict__), {"named_parameters", "n_redundant_experts", "loaded"})
+
+    def test_native_prefill_cache_keeps_metadata_and_device_guards(self):
+        path = ROOT / "vllm_ascend/models/kimi_k3.py"
+        fn = next(
+            node
+            for node in ast.parse(path.read_text()).body
+            if getattr(node, "name", None) == "_use_attn_res_prefill_cache"
+        )
+        context = NS(attn_metadata={})
+        ns = dict(is_forward_context_available=lambda: True, get_forward_context=lambda: context, is_950=lambda: True)
+        module = ast.Module(body=[fn], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+        select = ns["_use_attn_res_prefill_cache"]
+        for metadata in (
+            None,
+            {},
+            {"layer": NS()},
+            {"layer": NS(num_prefills=0, num_decodes=1)},
+            {"layer": NS(num_prefills=True, num_decodes=0)},
+            {"layer": NS(num_prefills=1, num_decodes=0, spec_sequence_masks=object())},
+        ):
+            context.attn_metadata = metadata
+            self.assertFalse(select())
+        context.attn_metadata = {"kda": NS(num_prefills=1, num_decodes=0), "mla": NS(num_prefills=2, num_decodes=0)}
+        self.assertTrue(select())
+        ns["is_950"] = lambda: False
+        self.assertFalse(select())
+        ns["is_950"] = lambda: True
+        ns["is_forward_context_available"] = lambda: False
+        self.assertFalse(select())
 
 
 if __name__ == "__main__":
