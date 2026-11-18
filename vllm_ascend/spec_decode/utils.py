@@ -23,8 +23,6 @@ def update_num_computed_tokens_for_batch_change(
 
     Requests that had drafts: corrected = prev_gpu + valid_count.
     New requests or non-draft (e.g. prefills): use CPU value directly.
-    Non-participating rows always accept exactly one token, so the accepted
-    count fallback is a constant instead of the (ordering-dependent) buffer.
     """
     # Clamp because prev_positions can be -1 for new requests
     gather_indices = prev_positions.clamp(min=0)
@@ -38,7 +36,7 @@ def update_num_computed_tokens_for_batch_change(
 
     n = prev_positions.shape[0]
     num_computed_tokens[:n].copy_(torch.where(participating, corrected, cpu_num_computed_tokens))
-    num_accepted_tokens.copy_(torch.where(participating, valid_counts, torch.ones_like(num_accepted_tokens)))
+    num_accepted_tokens.copy_(torch.where(participating, valid_counts, num_accepted_tokens))
 
 
 def correct_optimistic_seq_lens_cpu(

@@ -71,17 +71,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to run the DP metadata all-reduce on the default compute stream
-    # with a blocking D2H copy (legacy behavior). Default False: the 24-byte
-    # exchange (num_tokens + cudagraph_mode across DP ranks) is issued on a
-    # dedicated side stream and the host only waits for the tiny collective
-    # instead of the compute-stream backlog, removing a per-step host stream
-    # sync under async scheduling. Set to "1" to restore the legacy
-    # compute-stream path if HCCL cross-stream ordering issues are suspected.
-    # Valid values: "0" (default) or "1". Sensitive: No.
-    "VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM", "0"))
-    ),
     # Whether to enable the `fused` AttnRes backend for Kimi K3 (CANNBot DSL
     # kernels when `cannbot_dsl` is installed; pure-Torch `two_phase` as the
     # fallback). Disabling this env var keeps the previous `two_phase` backend
