@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU event-DAG regressions for the PR45/48/51 routed front and MC2 handoff."""
 
-import runpy
 import unittest
 from contextlib import contextmanager, nullcontext
-from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
-
-load_class = runpy.run_path(str(Path(__file__).with_name("test_kimi_v30_review.py")))["load_class"]
+from test_kimi_v30_review import load_class
 
 
 class EventGraph:
@@ -88,13 +85,14 @@ class TestKimiFrontOverlap(unittest.TestCase):
 
     def test_router_quant_and_topk_projection_remain_independent(self):
         for preprojected in (False, True):
-            with self.subTest(preprojected=preprojected):
-                self.check_front(preprojected)
+            for superkernel in (False, True):
+                with self.subTest(preprojected=preprojected, superkernel=superkernel):
+                    self.check_front(preprojected, superkernel=superkernel)
 
     def test_non_decode_retains_main_stream_gather_wait(self):
         self.check_front(True, decode=False)
 
-    def check_front(self, preprojected, *, decode=True):
+    def check_front(self, preprojected, *, decode=True, superkernel=False):
         graph = EventGraph()
         inputs = torch.arange(24).reshape(3, 8).to(torch.bfloat16)
         projected = inputs[:, :4] * 2
@@ -190,9 +188,10 @@ class TestKimiFrontOverlap(unittest.TestCase):
         runner._kimi_shared_comm_stream = graph.streams["comm"]
         runner._can_overlap_sp_shared_with = lambda transform: True
         runner._can_run_kimi_decode = lambda x: decode
+        runner._kimi_superkernel_active = superkernel
         # A new invocation must overwrite an earlier call's readiness.
         runner._kimi_shared_input_ready = object()
-        runner._compute_router_logits = lambda *args: graph.op("router_gemm") and logits
+        runner._compute_router_logits = lambda *args: (graph.op("router_gemm") and logits)
         runner.routed_input_transform = Projection()
         runner.routed_experts = NS(_select_experts=select)
         runner.moe_config = NS(hidden_dim=4)
@@ -242,7 +241,7 @@ class TestKimiFrontOverlap(unittest.TestCase):
 
         shared._prepare_gate_up_input = prepare_shared
         shared.enqueue_gate_up_after_router = enqueue_shared
-        shared.apply_activation = lambda x: (graph.op("shared_activation"), x)[1]
+        shared.apply_activation = lambda x: (graph.op("shared_situ"), x)[1]
         shared.layer = NS(gate_up_proj=NS())
         ns.update(BF16_SHARED_CORE_LIMIT=(32, 1), MXFP_SHARED_CORE_LIMIT=(16, 32))
         schedule_cls = load_class(
@@ -273,8 +272,8 @@ class TestKimiFrontOverlap(unittest.TestCase):
             self.assertEqual(graph.nodes[graph.index(name)][0], "shared")
             self.assertIn(ag, graph.ancestors(graph.index(name)))
         self.assertNotIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_gate_up")))
-        self.assertIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_activation")))
-        self.assertIn(graph.index("shared_activation"), graph.ancestors(graph.index("gmm1")))
+        self.assertIn(graph.index("dispatch"), graph.ancestors(graph.index("shared_situ")))
+        self.assertIn(graph.index("shared_situ"), graph.ancestors(graph.index("gmm1")))
 
     def test_precomputed_topk_preserves_mc2_prepare_masks_and_finalization(self):
         states = torch.ones(3, 4, dtype=torch.bfloat16)
@@ -353,8 +352,8 @@ class TestKimiFrontOverlap(unittest.TestCase):
         event = object()
         token_output = NS(combine_metadata=None, group_list_type=1, group_list=None)
         dispatcher = NS(
-            token_dispatch=lambda **kw: order.append("dispatch") or token_output,
-            token_combine=lambda **kw: order.append("combine") or kw["hidden_states"],
+            token_dispatch=lambda **kw: (order.append("dispatch") or token_output),
+            token_combine=lambda **kw: (order.append("combine") or kw["hidden_states"]),
         )
         ns = dict(
             torch=NS(
@@ -365,10 +364,10 @@ class TestKimiFrontOverlap(unittest.TestCase):
                 npu=NS(current_stream=lambda: NS(record_event=lambda: event)),
             ),
             _EXTRA_CTX=NS(moe_comm_method=object()),
-            build_token_dispatch_input=lambda **kw: order.append("prepare_dispatch") or object(),
+            build_token_dispatch_input=lambda **kw: (order.append("prepare_dispatch") or object()),
             TokenDispatcherWithMC2=type("MC2", (), {}),
             build_mlp_compute_input=lambda **kw: object(),
-            apply_moe_mlp=lambda *args: order.append("gmm") or (torch.ones(1), event),
+            apply_moe_mlp=lambda *args: (order.append("gmm") or (torch.ones(1), event)),
             FusedExpertsResult=NS,
         )
         cls = load_class("vllm_ascend/ops/fused_moe/moe_comm_method.py", "MoECommMethod", {"fused_experts"}, ns)

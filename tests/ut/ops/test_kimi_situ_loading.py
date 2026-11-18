@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU checks for optional SiTU registration, core-limit isolation and Router ordering."""
+"""CPU checks for recipes registration and PR5/PR45 execution boundaries."""
 
-import runpy
 import unittest
 from contextlib import contextmanager, nullcontext
-from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-load = runpy.run_path(str(Path(__file__).with_name("test_kimi_v30_moe.py")))["load"]
+from test_kimi_v30_moe import load
 
 
-class TestKimiStreamBoundaries(unittest.TestCase):
+class TestSituLoading(unittest.TestCase):
     def test_worker_loads_missing_ops_before_selection(self):
         for existing in ((), ("npu_situ_and_mul_sparse",)):
             with self.subTest(existing=existing):
