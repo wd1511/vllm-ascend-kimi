@@ -81,7 +81,7 @@ class TestDPDecodeMetadata(unittest.TestCase):
                     self.assertEqual(synced_mode, CUDAGraphMode.NONE)
                     self.assertEqual(runner._synced_batch_contains_decode, active_has_decode)
 
-    def test_mega_moe_disabled_returns_two_field_dp_metadata(self):
+    def test_mega_moe_disabled_uses_two_field_device_collective(self):
         packed = torch.tensor(
             [[4, 9], [CUDAGraphMode.FULL.value, CUDAGraphMode.NONE.value]], dtype=torch.int32
         )
@@ -93,20 +93,31 @@ class TestDPDecodeMetadata(unittest.TestCase):
                     runner.dp_rank = rank
                     runner.vllm_config = SimpleNamespace()
                     runner.ascend_config = SimpleNamespace(enable_fused_mc2=enabled)
+                    runner.device = torch.device("cpu")
+                    runner.pin_memory = False
+                    runner._dp_metadata_stream = None
+                    runner._dp_metadata_event = None
+                    runner._dp_metadata_pinned = None
+                    runner._dp_metadata_device = None
+
+                    def exchange(tensor, group):
+                        self.assertEqual(tensor.shape, (2, 2))
+                        self.assertEqual(group, "dp-device-group")
+                        tensor.copy_(packed)
+
                     with (
                         patch(
                             "vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group",
                             return_value=False,
                         ),
-                        patch.object(
-                            runner,
-                            "_dp_metadata_allreduce_on_side_stream",
-                            return_value=packed.clone(),
-                        ) as allreduce,
                         patch(
-                            "vllm_ascend.envs.VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM",
-                            False,
+                            "vllm_ascend.worker.model_runner_v1.get_dp_group",
+                            return_value=SimpleNamespace(device_group="dp-device-group"),
                         ),
+                        patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce", side_effect=exchange) as allreduce,
+                        patch("torch.npu.Stream"),
+                        patch("torch.npu.Event"),
+                        patch("torch.npu.stream", return_value=nullcontext()),
                         patch("vllm_ascend.worker.model_runner_v1.is_950", return_value=a5),
                     ):
                         max_tokens, tokens_across_dp, synced_mode = runner._sync_metadata_across_dp(
@@ -2017,170 +2028,6 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
         runner.valid_sampled_token_count_event = None
         with self.assertRaises(AssertionError):
             runner._correct_optimistic_seq_lens_cpu(1)
-
-
-class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
-    """_sync_metadata_across_dp: side-stream exchange keeps unpack semantics."""
-
-    REDUCED_UNIFORM = [[8, 16], [2, 2]]
-    REDUCED_MIN_MODE = [[8, 16], [0, 2]]
-
-    def _build_runner(self, dp_size=2, dp_rank=0):
-        runner = NPUModelRunner.__new__(NPUModelRunner)
-        runner.dp_size = dp_size
-        runner.dp_rank = dp_rank
-        runner.device = torch.device("cpu")
-        runner.pin_memory = False
-        runner.ascend_config = SimpleNamespace(enable_fused_mc2=0)
-        runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=dp_size))
-        runner._dp_metadata_stream = None
-        runner._dp_metadata_event = None
-        runner._dp_metadata_pinned = None
-        runner._dp_metadata_device = None
-        return runner
-
-    @staticmethod
-    def _fake_all_reduce(reduced_rows):
-        def _all_reduce(tensor, group=None):
-            for row_idx, row in enumerate(reduced_rows):
-                for col_idx, value in enumerate(row):
-                    tensor[row_idx][col_idx] = value
-
-        return _all_reduce
-
-    def _run_side_stream(self, runner, reduced_rows, **kwargs):
-        with (
-            patch(
-                "vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group",
-                return_value=False,
-            ),
-            patch(
-                "vllm_ascend.worker.model_runner_v1.dist.all_reduce",
-                side_effect=self._fake_all_reduce(reduced_rows),
-            ) as all_reduce,
-            patch("vllm_ascend.worker.model_runner_v1.get_dp_group") as dp_group,
-            patch(
-                "vllm_ascend.envs.VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM",
-                False,
-                create=True,
-            ),
-            patch("torch.npu.Stream") as stream_cls,
-            patch("torch.npu.Event"),
-            patch("torch.npu.stream", return_value=nullcontext()),
-        ):
-            dp_group.return_value.device_group = object()
-            result = runner._sync_metadata_across_dp(**kwargs)
-        return result, all_reduce, stream_cls
-
-    def test_side_stream_unpacks_reduced_metadata(self):
-        runner = self._build_runner()
-        result, all_reduce, _ = self._run_side_stream(
-            runner,
-            self.REDUCED_UNIFORM,
-            num_tokens=8,
-            cudagraph_mode=CUDAGraphMode.FULL,
-            allow_dp_padding=True,
-        )
-        max_tokens, padding, synced_mode = result
-        self.assertEqual(max_tokens, 16)
-        self.assertEqual(synced_mode, CUDAGraphMode.FULL)
-        torch.testing.assert_close(padding, torch.tensor([16, 16], dtype=torch.int32))
-        # The exchange ran once on the persistent device buffer and was
-        # synchronized before unpacking.
-        all_reduce.assert_called_once()
-        runner._dp_metadata_event.synchronize.assert_called_once_with()
-
-    def test_side_stream_min_mode_and_per_rank_padding(self):
-        runner = self._build_runner()
-        max_tokens, padding, synced_mode = self._run_side_stream(
-            runner,
-            self.REDUCED_MIN_MODE,
-            num_tokens=8,
-            cudagraph_mode=CUDAGraphMode.FULL,
-            allow_dp_padding=False,
-        )[0]
-        self.assertEqual(max_tokens, 16)
-        self.assertEqual(synced_mode, CUDAGraphMode.NONE)
-        torch.testing.assert_close(padding, torch.tensor([8, 16], dtype=torch.int32))
-        # The returned per-rank padding must not alias the reused pinned buffer.
-        self.assertNotEqual(padding.data_ptr(), runner._dp_metadata_pinned.data_ptr())
-
-    def test_side_stream_buffers_are_reused_across_calls(self):
-        runner = self._build_runner()
-        self._run_side_stream(
-            runner,
-            self.REDUCED_UNIFORM,
-            num_tokens=8,
-            cudagraph_mode=CUDAGraphMode.FULL,
-            allow_dp_padding=True,
-        )
-        (max_tokens, _, synced_mode), all_reduce, stream_cls = self._run_side_stream(
-            runner,
-            self.REDUCED_MIN_MODE,
-            num_tokens=8,
-            cudagraph_mode=CUDAGraphMode.FULL,
-            allow_dp_padding=True,
-        )
-        # The second exchange reused the lazily allocated side-stream
-        # resources (no new Stream construction) and returned the second
-        # reduction's values.
-        self.assertEqual(stream_cls.call_count, 0)
-        self.assertEqual(all_reduce.call_count, 1)
-        self.assertEqual(max_tokens, 16)
-        self.assertEqual(synced_mode, CUDAGraphMode.NONE)
-
-    def test_env_var_routes_to_compute_stream_path(self):
-        runner = self._build_runner()
-        reduced = torch.tensor(self.REDUCED_UNIFORM, dtype=torch.int32)
-        with (
-            patch(
-                "vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group",
-                return_value=False,
-            ),
-            patch(
-                "vllm_ascend.envs.VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM",
-                True,
-                create=True,
-            ),
-            patch.object(
-                runner,
-                "_dp_metadata_allreduce_on_compute_stream",
-                return_value=reduced.clone(),
-            ) as compute_path,
-            patch.object(
-                runner,
-                "_dp_metadata_allreduce_on_side_stream",
-                return_value=reduced.clone(),
-            ) as side_path,
-        ):
-            max_tokens, _, synced_mode = runner._sync_metadata_across_dp(
-                num_tokens=8,
-                cudagraph_mode=CUDAGraphMode.FULL,
-                allow_dp_padding=True,
-            )
-        compute_path.assert_called_once_with(8, CUDAGraphMode.FULL)
-        side_path.assert_not_called()
-        self.assertEqual(max_tokens, 16)
-        self.assertEqual(synced_mode, CUDAGraphMode.FULL)
-
-    def test_dp_size_one_and_skip_paths_unchanged(self):
-        runner = self._build_runner(dp_size=1)
-        max_tokens, padding, synced_mode = runner._sync_metadata_across_dp(
-            num_tokens=8, cudagraph_mode=CUDAGraphMode.FULL
-        )
-        self.assertEqual((max_tokens, padding, synced_mode), (8, None, CUDAGraphMode.FULL))
-
-        runner = self._build_runner(dp_size=2)
-        with patch(
-            "vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group",
-            return_value=True,
-        ):
-            max_tokens, padding, synced_mode = runner._sync_metadata_across_dp(
-                num_tokens=8, cudagraph_mode=CUDAGraphMode.FULL
-            )
-        self.assertEqual(max_tokens, 8)
-        torch.testing.assert_close(padding, torch.tensor([8, 8], dtype=torch.int32))
-        self.assertEqual(synced_mode, CUDAGraphMode.FULL)
 
 
 if __name__ == "__main__":
