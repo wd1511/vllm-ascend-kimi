@@ -96,6 +96,42 @@ class SubmittedSharedExpertGateUp:
     path: SharedExpertMLPPath
 
 
+class AscendSharedSparseSituAndMul(SituAndMul):
+    """Use the recipes sparse SiTU activation for NPU BF16 Kimi shared experts."""
+
+    def __init__(self, beta: float, linear_beta: float | None):
+        super().__init__(beta=beta, linear_beta=linear_beta, compile_native=False)
+        self.register_buffer(
+            "_all_rows_expert_tokens",
+            torch.tensor([torch.iinfo(torch.int64).max], dtype=torch.int64),
+            persistent=False,
+        )
+
+    def can_use_sparse(self, x: torch.Tensor) -> bool:
+        return (
+            x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.shape[0] > 0
+            and self.beta > 0
+            and self.linear_beta is not None
+            and self.linear_beta > 0
+            and self._all_rows_expert_tokens.device == x.device
+            and hasattr(torch.ops.custom, "npu_situ_and_mul_sparse")
+        )
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.can_use_sparse(x):
+            return super().forward_native(x)
+        return torch.ops.custom.npu_situ_and_mul_sparse(
+            x,
+            self._all_rows_expert_tokens,
+            beta=self.beta,
+            alpha=self.linear_beta,
+            high_precision=False,
+        )
+
+
 class AscendSharedExperts:
     """Ascend-owned shared expert executor.
 
@@ -595,29 +631,36 @@ class AscendSharedExperts:
             milestones.shared_activation_overlap_start,
             "shared_activation_overlap_start",
         )
-        if self.situ_activation is not None:
+        gate_up = submitted_gate_up.gate_up
+        situ_activation = self.situ_activation
+        if isinstance(situ_activation, AscendSharedSparseSituAndMul) and situ_activation.can_use_sparse(gate_up):
+            shared_act = self.apply_activation(gate_up)
+            down_input = self._prepare_linear_input_for_overlap(self.layer.down_proj, shared_act)
+        elif situ_activation is not None:
             quantized_x, swiglu_out_scale = torch.ops._C_ascend.situ_mx_quant(
-                x=submitted_gate_up.gate_up,
-                beta=self.situ_activation.beta,
-                linear_beta=self.situ_activation.linear_beta or 0.0,
+                x=gate_up,
+                beta=situ_activation.beta,
+                linear_beta=situ_activation.linear_beta or 0.0,
                 activate_left=True,
                 dst_type=SITU_MX_DST_TYPE_E4M3FN,
             )
+            down_input = (quantized_x, swiglu_out_scale)
         else:
             quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
-                submitted_gate_up.gate_up,
+                gate_up,
                 topk_weight=None,
                 group_index=None,
                 dst_type=torch.float8_e4m3fn,
                 quant_mode=2,
                 clamp_value=self.swiglu_limit,
             )
+            down_input = (quantized_x, swiglu_out_scale)
         self._wait_for_routed_stage(
             milestones,
             milestones.routed_combine_start,
             "routed_combine_start",
         )
-        return self.part2(submitted_gate_up.hidden_states, (quantized_x, swiglu_out_scale))
+        return self.part2(submitted_gate_up.hidden_states, down_input)
 
     def _can_fuse_w8a8_mxfp_activation(self, gate_up: torch.Tensor) -> bool:
         if self.quant_type != QuantType.W8A8MXFP or has_lora(self.lora_context):
