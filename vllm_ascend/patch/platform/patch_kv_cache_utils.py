@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -26,6 +27,27 @@ _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size
+
+
+def _kimi_k3_physical_layout_key(layer_name: str, spec: KVCacheSpec) -> str:
+    """Return the physical cache layout family used by a Kimi K3 layer."""
+    if isinstance(spec, MambaSpec):
+        return "mamba"
+    if layer_name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX):
+        return "target_attention"
+    if layer_name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX):
+        return "draft_attention"
+    return "default"
+
+
+def _physical_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Return the unpadded page size used by the backing cache tensor.
+
+    ``page_size_bytes`` may include hybrid-cache padding for scheduler
+    block-table compatibility. Independent Kimi K3 backing tensors must use
+    the layer layout size instead.
+    """
+    return getattr(spec, "unpadded_page_size_bytes", spec.page_size_bytes)
 
 
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
@@ -81,7 +103,57 @@ def _ascend_resolve_kv_cache_block_sizes(
         hash_block_size = math.gcd(*group_block_sizes)
         return scheduler_block_size, hash_block_size
 
+    # Kimi K3 Window-GQA DSpark has a small sliding-window draft block next
+    # to the target/Mamba block.  The upstream resolver deliberately falls
+    # back to scheduler_block_size when a Mamba block differs from the global
+    # cache block size.  That fallback is invalid here: after engine-core
+    # normalizes cache_config.block_size to the smallest group (the SWA
+    # kernel block), the SlidingWindowManager still owns that small block and
+    # every real group must be divisible by the hash granularity.
+    if _is_kimi_k3_dspark_window_kv_cache_config(groups):
+        group_block_sizes = [group.kv_cache_spec.block_size for group in groups]
+        scheduler_block_size = math.lcm(*group_block_sizes)
+        if not cache_config.enable_prefix_caching and vllm_config.kv_transfer_config is None:
+            return scheduler_block_size, scheduler_block_size
+        requested = cache_config.prefix_match_unit
+        hash_block_size = requested if requested is not None else math.gcd(*group_block_sizes)
+        if hash_block_size <= 0 or any(block_size % hash_block_size != 0 for block_size in group_block_sizes):
+            raise ValueError(
+                f"Invalid prefix_match_unit={hash_block_size}; all Kimi K3 DSpark "
+                f"KV cache group block sizes must be divisible by it. "
+                f"Got group block sizes={group_block_sizes}."
+            )
+        logger.info(
+            "Kimi K3 Window-GQA DSpark KV blocks: group sizes=%s, scheduler=%d, hash=%d",
+            sorted(set(group_block_sizes)),
+            scheduler_block_size,
+            hash_block_size,
+        )
+        return scheduler_block_size, hash_block_size
+
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
+
+def _is_kimi_k3_dspark_window_kv_cache_config(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """Recognize Kimi K3 + Window-GQA DSpark with aligned Mamba states."""
+    has_target = False
+    has_window_draft = False
+    has_mamba = False
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align":
+            return False
+        layer_names = group.layer_names
+        if any(name.startswith(_KIMI_K3_TARGET_LAYER_PREFIX) for name in layer_names):
+            has_target |= isinstance(spec, FullAttentionSpec)
+            has_mamba |= isinstance(spec, MambaSpec)
+        if any(name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) for name in layer_names):
+            has_window_draft |= isinstance(spec, SlidingWindowSpec)
+    return has_target and has_window_draft and has_mamba
 
 
 def _get_kimi_k3_dspark_mixed_kv_cache_groups(
@@ -89,12 +161,12 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
 ) -> list[KVCacheGroupSpec] | None:
     """Build topology-independent Kimi K3 DSpark scheduler groups.
 
-    Target and causal draft attention layers require the same full-sequence
-    block ownership. Putting them in one UniformType group lets them share one
-    scheduler block table while preserving a separate physical page per layer.
-    Recurrent layers are split into the fewest balanced groups whose size does
-    not exceed the attention group. This minimizes scheduler groups while
-    keeping the recurrent groups balanced.
+    Target MLA, draft attention, and recurrent layers use separate cache
+    groups. Target MLA uses the compact FlashMLA cache layout, while draft
+    attention and recurrent layers use different physical layouts; sharing a
+    scheduler group would allow the physical planner to alias incompatible
+    pages. Recurrent layers are split into the fewest balanced groups whose
+    size does not exceed the total attention layer count.
 
     Block and page sizes are resolved by the runtime and intentionally not
     fixed here: TP8 and TP16 produce different sizes but the same ownership
@@ -109,7 +181,7 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     draft_attention_specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, FullAttentionSpec)
+        if name.startswith(_KIMI_K3_DRAFT_LAYER_PREFIX) and isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
     }
     mamba_specs = {
         name: spec
@@ -124,38 +196,75 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         or not mamba_specs
         or matched_layer_count != len(kv_cache_spec)
     ):
+        if target_attention_specs or mamba_specs:
+            matched_names = target_attention_specs.keys() | draft_attention_specs.keys() | mamba_specs.keys()
+            logger.info(
+                "[KV_CACHE_DIAG] Kimi K3 grouping fallback: reason=layer_signature "
+                "target=%d draft=%d mamba=%d total=%d unmatched=%s",
+                len(target_attention_specs),
+                len(draft_attention_specs),
+                len(mamba_specs),
+                len(kv_cache_spec),
+                [(name, type(spec).__name__) for name, spec in kv_cache_spec.items() if name not in matched_names],
+            )
         return None
 
     attention_specs = [*target_attention_specs.values(), *draft_attention_specs.values()]
     all_specs = [*attention_specs, *mamba_specs.values()]
     # Only attention layers share a scheduler block table. Mamba keeps its
     # own groups and may use max_model_len as block_size when cache_mode=none.
+    window_draft = all(isinstance(spec, SlidingWindowSpec) for spec in draft_attention_specs.values())
     if (
-        len({spec.block_size for spec in attention_specs}) != 1
+        (len({spec.block_size for spec in attention_specs}) != 1 and not window_draft)
+        or (window_draft and any(spec.mamba_cache_mode != "align" for spec in mamba_specs.values()))
         or len({spec.page_size_bytes for spec in all_specs}) != 1
     ):
+        logger.info(
+            "[KV_CACHE_DIAG] Kimi K3 grouping fallback: reason=page_alignment "
+            "target=%s draft=%s mamba=%s",
+            sorted(
+                (spec.block_size, spec.page_size_bytes, _physical_page_size_bytes(spec))
+                for spec in set(target_attention_specs.values())
+            ),
+            sorted(
+                (spec.block_size, spec.page_size_bytes, _physical_page_size_bytes(spec))
+                for spec in set(draft_attention_specs.values())
+            ),
+            sorted(
+                (spec.block_size, spec.page_size_bytes, _physical_page_size_bytes(spec))
+                for spec in set(mamba_specs.values())
+            ),
+        )
         return None
 
     first_mamba_spec = next(iter(mamba_specs.values()))
     if any(spec != first_mamba_spec for spec in mamba_specs.values()):
+        logger.info("[KV_CACHE_DIAG] Kimi K3 grouping fallback: reason=nonuniform_mamba")
         return None
 
-    # Insert target attention first. generate_scheduler_kv_cache_config unwraps a
-    # UniformType group to its first spec, and this representative is registered
-    # with the FullAttentionManager needed by both target and draft attention.
-    mixed_attention_specs = {**target_attention_specs, **draft_attention_specs}
-    mixed_attention_spec = UniformTypeKVCacheSpecs.from_specs(mixed_attention_specs)
-    if mixed_attention_spec is None:
+    target_attention_spec = UniformTypeKVCacheSpecs.from_specs(target_attention_specs)
+    draft_attention_spec = UniformTypeKVCacheSpecs.from_specs(draft_attention_specs)
+    if target_attention_spec is None or draft_attention_spec is None:
+        logger.info(
+            "[KV_CACHE_DIAG] Kimi K3 grouping fallback: reason=nonuniform_attention target=%s draft=%s",
+            target_attention_spec is not None,
+            draft_attention_spec is not None,
+        )
         return None
 
     groups = [
         KVCacheGroupSpec(
-            layer_names=list(mixed_attention_specs),
-            kv_cache_spec=mixed_attention_spec,
-        )
+            layer_names=list(target_attention_specs),
+            kv_cache_spec=target_attention_spec,
+        ),
+        KVCacheGroupSpec(
+            layer_names=list(draft_attention_specs),
+            kv_cache_spec=draft_attention_spec,
+        ),
     ]
     mamba_layer_names = list(mamba_specs)
-    mamba_group_count = cdiv(len(mamba_layer_names), len(mixed_attention_specs))
+    attention_layer_count = len(target_attention_specs) + len(draft_attention_specs)
+    mamba_group_count = cdiv(len(mamba_layer_names), attention_layer_count)
     for group_idx in range(mamba_group_count):
         layer_names = mamba_layer_names[group_idx::mamba_group_count]
         group_specs = {name: mamba_specs[name] for name in layer_names}
@@ -172,7 +281,7 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         "Using Kimi K3 DSpark mixed KV grouping: %d target + %d draft attention layers, followed by Mamba groups %s",
         len(target_attention_specs),
         len(draft_attention_specs),
-        [len(group.layer_names) for group in groups[1:]],
+        [len(group.layer_names) for group in groups[2:]],
     )
     return groups
 
@@ -334,6 +443,13 @@ def _get_kv_cache_config_deepseek_v4(
     per (tuple_idx, bucket) whose shared_by is the union of per-group
     layers at that slot.
     """
+    if any(
+        layer_name.startswith((_KIMI_K3_TARGET_LAYER_PREFIX, _KIMI_K3_DRAFT_LAYER_PREFIX))
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    ):
+        return _get_kimi_k3_physical_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
+
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
@@ -377,6 +493,77 @@ def _get_kv_cache_config_deepseek_v4(
     for i in range(len(mtp_layer_names)):
         kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
 
+    return num_blocks, kv_cache_tensors
+
+
+def _get_kimi_k3_physical_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan Kimi K3 tensors without sharing incompatible physical layouts.
+
+    The scheduler groups may still share ownership, but target MLA, draft
+    attention, and Mamba layers must not share the same raw tensor. FlashMLA
+    uses a compact merged cache while Mamba uses the original state page
+    layout, so equal scheduler page sizes do not imply compatible storage.
+    """
+    bucketed: list[dict[tuple[str, int], list[str]]] = []
+    page_sizes_by_layout: dict[str, set[int]] = defaultdict(set)
+    tuple_counts_by_layout: dict[str, int] = defaultdict(int)
+    mtp_layer_names: list[str] = []
+    mtp_page_size = 0
+
+    for group in kv_cache_groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs = group.kv_cache_spec.kv_cache_specs
+        buckets: dict[tuple[str, int], list[str]] = defaultdict(list)
+        for layer_name in group.layer_names:
+            if "mtp" in layer_name:
+                mtp_layer_names.append(layer_name)
+                mtp_page_size = _physical_page_size_bytes(specs[layer_name])
+                continue
+            layout_key = _kimi_k3_physical_layout_key(layer_name, specs[layer_name])
+            page_size = _physical_page_size_bytes(specs[layer_name])
+            buckets[(layout_key, page_size)].append(layer_name)
+            page_sizes_by_layout[layout_key].add(page_size)
+            tuple_counts_by_layout[layout_key] = max(
+                tuple_counts_by_layout[layout_key],
+                len(buckets[(layout_key, page_size)]),
+            )
+        bucketed.append(buckets)
+
+    physical_page_bytes_per_block = sum(
+        page_size * tuple_counts_by_layout[layout_key]
+        for layout_key, page_sizes in page_sizes_by_layout.items()
+        for page_size in page_sizes
+    )
+    physical_page_bytes_per_block += len(mtp_layer_names) * mtp_page_size
+    assert physical_page_bytes_per_block > 0
+
+    num_blocks = available_memory // physical_page_bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for layout_key in sorted(page_sizes_by_layout):
+        for tuple_idx in range(tuple_counts_by_layout[layout_key]):
+            for page_size in sorted(page_sizes_by_layout[layout_key]):
+                shared_by: list[str] = []
+                for buckets in bucketed:
+                    layers = buckets.get((layout_key, page_size), [])
+                    if tuple_idx < len(layers):
+                        shared_by.append(layers[tuple_idx])
+                if shared_by:
+                    kv_cache_tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by))
+
+    for layer_name in mtp_layer_names:
+        kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[layer_name]))
+
+    logger.info(
+        "Using Kimi K3 layout-separated KV cache tensors: layouts=%s, tensors=%d",
+        {key: tuple_counts_by_layout[key] for key in sorted(tuple_counts_by_layout)},
+        len(kv_cache_tensors),
+    )
     return num_blocks, kv_cache_tensors
 
 

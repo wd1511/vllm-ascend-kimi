@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend import ascend_forward_context as afc
 from vllm_ascend.ascend_forward_context import MoECommType
@@ -54,6 +55,7 @@ def _make_vllm_config(
         world_size_across_dp=world_size,
         pipeline_parallel_size=pipeline_parallel_size,
         tensor_parallel_size=tensor_parallel_size,
+        use_sequence_parallel_moe=False,
     )
     compilation_config = SimpleNamespace(
         cudagraph_capture_sizes=cudagraph_capture_sizes or [],
@@ -92,7 +94,14 @@ def _patch_select_moe_comm_method_deps(
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_fused_mc2=enable_fused_mc2),
+        lambda: SimpleNamespace(
+            enable_fused_mc2=enable_fused_mc2,
+            eplb_config=SimpleNamespace(
+                dynamic_eplb=False,
+                num_redundant_experts=0,
+            ),
+            mix_placement=False,
+        ),
     )
 
 
@@ -459,6 +468,253 @@ def test_select_moe_comm_method_a5(monkeypatch, num_tokens, world_size, top_k_ex
     vllm_config = _make_vllm_config(world_size=world_size, top_k_experts=top_k_experts)
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+def test_select_moe_comm_method_a5_kimi_situ_uses_mega_moe(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    monkeypatch.setattr(afc, "get_a5_mega_moe_buffer_tokens_per_rank", lambda *_args, **_kwargs: 128)
+    vllm_config = _make_vllm_config(world_size=32, top_k_experts=16)
+    vllm_config.quant_config = SimpleNamespace(quant_description={"group_size": 32})
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(sp_size=8),
+        ),
+        quant_type=afc.QuantType.W4A8MXFP,
+        activation=MoEActivation.SITU,
+    )
+    model_instance = SimpleNamespace(modules=lambda: [routed_experts])
+
+    assert afc.select_moe_comm_method(1024, vllm_config, model_instance) == MoECommType.FUSED_MC2
+
+
+def test_select_moe_comm_method_a5_kimi_situ_d_node_does_not_use_mega_moe(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    monkeypatch.setattr(afc, "get_a5_mega_moe_buffer_tokens_per_rank", lambda *_args, **_kwargs: 128)
+    vllm_config = _make_vllm_config(
+        world_size=32,
+        top_k_experts=16,
+        kv_role="kv_consumer",
+    )
+    vllm_config.quant_config = SimpleNamespace(quant_description={"group_size": 32})
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(sp_size=8),
+        ),
+        quant_type=afc.QuantType.W4A8MXFP,
+        activation=MoEActivation.SITU,
+    )
+    model_instance = SimpleNamespace(modules=lambda: [routed_experts])
+
+    assert afc.select_moe_comm_method(32, vllm_config, model_instance) == MoECommType.MC2
+
+
+def test_select_moe_comm_method_a5_decode_batch_does_not_use_mega_moe(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    monkeypatch.setattr(afc, "get_a5_mega_moe_buffer_tokens_per_rank", lambda *_args, **_kwargs: 128)
+    vllm_config = _make_vllm_config(world_size=32, top_k_experts=16, kv_role="kv_both")
+    vllm_config.quant_config = SimpleNamespace(quant_description={"group_size": 32})
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(sp_size=8)),
+        quant_type=afc.QuantType.W4A8MXFP,
+        activation=MoEActivation.SITU,
+    )
+    model_instance = SimpleNamespace(modules=lambda: [routed_experts])
+
+    assert afc.select_moe_comm_method(32, vllm_config, model_instance) == MoECommType.FUSED_MC2
+    assert (
+        afc.select_moe_comm_method(
+            32,
+            vllm_config,
+            model_instance,
+            batch_contains_decode=True,
+        )
+        == MoECommType.MC2
+    )
+
+
+def test_a5_mega_moe_selection_logs_decode_and_capacity_rejections(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    ascend_config = SimpleNamespace(
+        enable_fused_mc2=1,
+        mega_moe_max_tokens=65536,
+        eplb_config=SimpleNamespace(dynamic_eplb=False, num_redundant_experts=0),
+        mix_placement=False,
+    )
+    monkeypatch.setattr(afc, "get_ascend_config", lambda: ascend_config)
+    monkeypatch.setattr(afc, "get_a5_mega_moe_buffer_tokens_per_rank", lambda *_args, **_kwargs: 128)
+    log = MagicMock()
+    log.isEnabledFor.return_value = True
+    monkeypatch.setattr(afc, "logger", log)
+    vllm_config = _make_vllm_config(max_num_batched_tokens=2048, top_k_experts=16, kv_role="kv_both")
+    vllm_config.quant_config = SimpleNamespace(quant_description={"group_size": 32})
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(sp_size=8)),
+        quant_type=afc.QuantType.W4A8MXFP,
+        activation=MoEActivation.SITU,
+    )
+    model_instance = SimpleNamespace(modules=lambda: [routed_experts])
+
+    assert (
+        afc.select_moe_comm_method(32, vllm_config, model_instance, batch_contains_decode=True)
+        == MoECommType.MC2
+    )
+    assert afc.select_moe_comm_method(1025, vllm_config, model_instance) == MoECommType.ALLGATHER
+    assert afc.select_moe_comm_method(32, vllm_config, model_instance) == MoECommType.FUSED_MC2
+
+    assert [call.args[1] for call in log.info_once.call_args_list] == [
+        "contains_decode",
+        "over_buffer_capacity",
+    ]
+    decisions = [call.args for call in log.debug.call_args_list if call.args[0].startswith("A5 MegaMoE selection:")]
+    assert len(decisions) == 3
+    assert decisions[0][1:7] == ("MC2", "contains_decode", 32, 4, 128, 128)
+    assert decisions[1][1:7] == ("ALLGATHER", "over_buffer_capacity", 1025, 129, 128, 128)
+    assert decisions[2][1:7] == ("FUSED_MC2", "none", 32, 4, 128, 128)
+
+
+@pytest.mark.parametrize(
+    ("kv_connector", "kv_role", "expected_capacity"),
+    [
+        (None, None, 256),
+        (None, "kv_both", 256),
+        ("custom_connector", None, 64),
+    ],
+)
+def test_a5_mega_moe_capacity_for_mixed_deployment(monkeypatch, kv_connector, kv_role, expected_capacity):
+    monkeypatch.setattr(afc, "get_ascend_config", lambda: SimpleNamespace(mega_moe_max_tokens=65536))
+    monkeypatch.setattr(afc, "get_ep_group", lambda: SimpleNamespace(world_size=8))
+    vllm_config = _make_vllm_config(
+        tensor_parallel_size=8,
+        max_num_batched_tokens=2048,
+        kv_connector=kv_connector,
+        kv_role=kv_role,
+    )
+
+    assert (
+        afc.get_a5_mega_moe_buffer_tokens_per_rank(vllm_config, mc2_tokens_capacity=512, sp_size=8)
+        == expected_capacity
+    )
+
+
+def test_a5_mega_moe_capacity_uses_scheduler_budget_without_kv_transfer(monkeypatch):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(mega_moe_max_tokens=65536),
+    )
+    vllm_config = _make_vllm_config(
+        world_size=32,
+        max_num_batched_tokens=8192,
+    )
+    monkeypatch.setattr(afc, "get_ep_group", lambda: SimpleNamespace(world_size=32))
+
+    assert afc.get_a5_mega_moe_buffer_tokens_per_rank(vllm_config, mc2_tokens_capacity=128) == 2048
+
+
+@pytest.mark.parametrize(
+    ("sp_size", "expected"),
+    [
+        (1, 2048),
+        (8, 1024),
+    ],
+)
+def test_a5_mega_moe_capacity_uses_rank_local_execution_budget(monkeypatch, sp_size, expected):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(mega_moe_max_tokens=65536),
+    )
+    monkeypatch.setattr(afc, "get_ep_group", lambda: SimpleNamespace(world_size=32))
+    vllm_config = _make_vllm_config(
+        world_size=64,
+        pipeline_parallel_size=2,
+        tensor_parallel_size=8,
+        max_num_batched_tokens=8192,
+    )
+
+    assert (
+        afc.get_a5_mega_moe_buffer_tokens_per_rank(
+            vllm_config,
+            sp_size=sp_size,
+        )
+        == expected
+    )
+
+
+def test_select_a5_mega_moe_compares_rank_local_tokens(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=4096,
+        ep_world_size=32,
+        enable_fused_mc2=1,
+    )
+    monkeypatch.setattr(afc, "get_a5_mega_moe_buffer_tokens_per_rank", lambda *_args, **_kwargs: 256)
+    vllm_config = _make_vllm_config(
+        world_size=32,
+        tensor_parallel_size=8,
+        top_k_experts=16,
+    )
+    vllm_config.quant_config = SimpleNamespace(quant_description={"group_size": 32})
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(sp_size=8),
+        ),
+        quant_type=afc.QuantType.W4A8MXFP,
+        activation=MoEActivation.SITU,
+    )
+    model_instance = SimpleNamespace(modules=lambda: [routed_experts])
+
+    assert afc.select_moe_comm_method(2048, vllm_config, model_instance) == MoECommType.FUSED_MC2
+    assert afc.select_moe_comm_method(2049, vllm_config, model_instance) == MoECommType.MC2
+
+
+def test_select_a5_mega_moe_keeps_non_sp_deepseek_token_semantics(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=4096,
+        ep_world_size=32,
+        enable_fused_mc2=1,
+    )
+    monkeypatch.setattr(afc, "get_a5_mega_moe_buffer_tokens_per_rank", lambda *_args, **_kwargs: 256)
+    vllm_config = _make_vllm_config(
+        world_size=32,
+        tensor_parallel_size=8,
+        top_k_experts=8,
+    )
+    vllm_config.quant_config = SimpleNamespace(quant_description={"group_size": 32})
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(sp_size=1),
+        ),
+        quant_type=afc.QuantType.W4A8MXFP,
+        activation=MoEActivation.SILU,
+    )
+    model_instance = SimpleNamespace(modules=lambda: [routed_experts])
+
+    assert afc.select_moe_comm_method(256, vllm_config, model_instance) == MoECommType.FUSED_MC2
+    assert afc.select_moe_comm_method(257, vllm_config, model_instance) == MoECommType.MC2
 
 
 def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):

@@ -61,10 +61,11 @@ class TestUnifiedApplyMLP310(TestBase):
 
         comm_impl = AllGatherCommImpl310.__new__(AllGatherCommImpl310)
 
-        output, before_gmm2_evt = comm_impl._apply_mlp(mlp_compute_input)
+        output, before_gmm2_evt, after_gmm1_evt = comm_impl._apply_mlp(mlp_compute_input)
 
         self.assertIs(output, mlp_output)
         self.assertIsNone(before_gmm2_evt)
+        self.assertIsNone(after_gmm1_evt)
         mock_unified_apply_mlp.assert_called_once_with(mlp_compute_input=mlp_compute_input)
 
     @patch("torch_npu.npu_grouped_matmul", create=True)

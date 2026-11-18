@@ -163,11 +163,20 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                     for g in kv_cache_config.kv_cache_groups
                 ), "block_size must be divisible by hash_block_size"
-            self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-                isinstance(g.kv_cache_spec, MambaSpec)
-                and g.kv_cache_spec.mamba_cache_mode == "align"
-                and g.kv_cache_spec.block_size > hash_block_size
-                for g in kv_cache_config.kv_cache_groups
+            # SWA needs whole-block hits. Fine hashing does not imply that
+            # every manager supports partial blocks (e.g. Kimi + SWA draft).
+            self.enable_partial_hash_hits = (
+                dcp_world_size == 1
+                and all(
+                    isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                    for g in kv_cache_config.kv_cache_groups
+                )
+                and any(
+                    isinstance(g.kv_cache_spec, MambaSpec)
+                    and g.kv_cache_spec.mamba_cache_mode == "align"
+                    and g.kv_cache_spec.block_size > hash_block_size
+                    for g in kv_cache_config.kv_cache_groups
+                )
             )
             self.verify_and_split_kv_cache_groups()
 
@@ -272,11 +281,19 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                     for g in kv_cache_config.kv_cache_groups
                 ), "block_size must be divisible by hash_block_size"
-            self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-                isinstance(g.kv_cache_spec, MambaSpec)
-                and g.kv_cache_spec.mamba_cache_mode == "align"
-                and g.kv_cache_spec.block_size > hash_block_size
-                for g in kv_cache_config.kv_cache_groups
+            # Keep the same whole-block hit contract as the v0.27.1 branch.
+            self.enable_partial_hash_hits = (
+                dcp_world_size == 1
+                and all(
+                    isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                    for g in kv_cache_config.kv_cache_groups
+                )
+                and any(
+                    isinstance(g.kv_cache_spec, MambaSpec)
+                    and g.kv_cache_spec.mamba_cache_mode == "align"
+                    and g.kv_cache_spec.block_size > hash_block_size
+                    for g in kv_cache_config.kv_cache_groups
+                )
             )
             self.verify_and_split_kv_cache_groups()
 

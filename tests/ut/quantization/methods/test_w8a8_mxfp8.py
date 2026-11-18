@@ -137,6 +137,27 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(call_kwargs["group_sizes"], [1, 1, self.scheme.group_size])
         self.assertEqual(call_kwargs["output_dtype"], torch.float16)
 
+    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.torch_npu")
+    def test_apply_prequantized_input_does_not_quantize_again(self, mock_torch_npu):
+        quantized = torch.zeros(3, 3584, dtype=torch.float8_e4m3fn)
+        scale = torch.zeros(3, 56, 2, dtype=torch.uint8)
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.empty(3584, 128, dtype=torch.float8_e4m3fn), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.zeros(56, 128, 2, dtype=torch.uint8), requires_grad=False)
+        expected = torch.randn(3, 128, dtype=torch.bfloat16)
+        mock_torch_npu.npu_quant_matmul.return_value = expected
+
+        output = self.scheme.apply(layer, (quantized, scale))
+
+        self.assertIs(output, expected)
+        mock_torch_npu.npu_dynamic_mx_quant.assert_not_called()
+        mock_torch_npu.npu_quant_matmul.assert_called_once()
+        args, kwargs = mock_torch_npu.npu_quant_matmul.call_args
+        self.assertIs(args[0], quantized)
+        self.assertIs(kwargs["pertoken_scale"], scale)
+        self.assertEqual(kwargs["output_dtype"], torch.bfloat16)
+        self.assertEqual(kwargs["group_sizes"], [1, 1, 32])
+
 
 class TestAscendW8A8MXFP8MoEMethod(TestBase):
     num_experts = 8

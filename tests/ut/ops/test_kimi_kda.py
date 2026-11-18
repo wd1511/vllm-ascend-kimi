@@ -266,7 +266,8 @@ def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
     assert attention._forward.call_args.kwargs["beta_is_preprocessed"] is True
 
 
-def test_overlapped_qkv_bfg_keeps_two_stage_vector_cube_overlap():
+@pytest.mark.parametrize("is_compiling, enable_npugraph_ex", [(False, False), (True, True)])
+def test_overlapped_qkv_bfg_keeps_two_stage_vector_cube_overlap(is_compiling, enable_npugraph_ex):
     attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
     nn.Module.__init__(attention)
     trace: list[str] = []
@@ -300,6 +301,13 @@ def test_overlapped_qkv_bfg_keeps_two_stage_vector_cube_overlap():
     attention._postprocess_bfg = MagicMock(side_effect=record_postprocess_bfg)
 
     with (
+        patch("vllm_ascend.ops.kimi_kda.torch.compiler.is_compiling", return_value=is_compiling),
+        patch(
+            "vllm_ascend.ops.kimi_kda.get_ascend_config",
+            return_value=SimpleNamespace(
+                ascend_compilation_config=SimpleNamespace(enable_npugraph_ex=enable_npugraph_ex)
+            ),
+        ),
         patch("vllm_ascend.ops.kimi_kda.torch.npu.current_stream", return_value=main_stream),
         patch("vllm_ascend.ops.kimi_kda._kda_bfg_stream", return_value=bfg_stream),
         patch(
@@ -332,6 +340,42 @@ def test_overlapped_qkv_bfg_keeps_two_stage_vector_cube_overlap():
         "output_gate.record_stream:main",
         "main.wait:bfg_ready",
     ]
+
+
+def test_compiled_fusion_pass_kda_avoids_record_stream():
+    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
+    nn.Module.__init__(attention)
+    trace: list[str] = []
+    hidden_states = _RecordingTensor("hidden", trace)
+    fused_bfg = object()
+    quantized_qkv = object()
+    mixed_qkv = object()
+    processed_bfg = (object(), object(), object())
+
+    def record_step(name: str, result: object) -> object:
+        trace.append(name)
+        return result
+
+    attention._project_bfg = MagicMock(side_effect=lambda _: record_step("project_bfg", fused_bfg))
+    attention._quantize_fused_qkv = MagicMock(side_effect=lambda _: record_step("dynamic_quant", quantized_qkv))
+    attention._matmul_fused_qkv = MagicMock(side_effect=lambda _: record_step("qkv_matmul", mixed_qkv))
+    attention._postprocess_bfg = MagicMock(side_effect=lambda _: record_step("postprocess_bfg", processed_bfg))
+
+    with (
+        patch("vllm_ascend.ops.kimi_kda.torch.compiler.is_compiling", return_value=True),
+        patch(
+            "vllm_ascend.ops.kimi_kda.get_ascend_config",
+            return_value=SimpleNamespace(ascend_compilation_config=SimpleNamespace(enable_npugraph_ex=False)),
+        ),
+        patch("vllm_ascend.ops.kimi_kda.torch.npu.current_stream") as current_stream,
+        patch("vllm_ascend.ops.kimi_kda._kda_bfg_stream") as bfg_stream,
+    ):
+        actual = attention._run_overlapped_qkv_bfg(hidden_states)
+
+    assert actual == (mixed_qkv, *processed_bfg)
+    assert trace == ["project_bfg", "dynamic_quant", "qkv_matmul", "postprocess_bfg"]
+    current_stream.assert_not_called()
+    bfg_stream.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -458,7 +502,7 @@ def test_kda_empty_forward_context_clears_preallocated_output():
         "vllm_ascend.ops.kimi_kda.get_forward_context",
         return_value=SimpleNamespace(attn_metadata=None),
     ):
-        attention._forward(
+        attention._kda_forward_impl(
             mixed_qkv=torch.empty(4, 18),
             g1=torch.empty(1, 4, 2, 3),
             g2=torch.empty(4, 2, 3),

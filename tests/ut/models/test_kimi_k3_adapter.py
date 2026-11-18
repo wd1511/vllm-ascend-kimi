@@ -4,11 +4,13 @@
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
 
 from vllm_ascend.models import kimi_k3
+from vllm_ascend.models.common.ops import sequence_parallel
 from vllm_ascend.models.kimi_k3 import (
     AscendKimiK3MultiModalProjector,
     AscendKimiLinearModel,
@@ -18,13 +20,13 @@ from vllm_ascend.models.kimi_k3_dspark import (
 )
 
 
-def test_kimi_moe_leaves_routed_input_transform_to_runner():
+def test_kimi_moe_leaves_gate_and_routed_input_transform_to_runner():
     moe = kimi_k3.AscendKimiMoE.__new__(kimi_k3.AscendKimiMoE)
     nn.Module.__init__(moe)
     hidden_states = torch.randn(4, 8)
-    router_logits = torch.randn(4, 16)
     output = torch.randn(4, 8)
-    moe.gate = MagicMock(return_value=(router_logits, None))
+    gate = MagicMock()
+    moe.gate = gate
     moe.experts = MagicMock(return_value=output)
 
     result = moe.forward(hidden_states)
@@ -32,8 +34,47 @@ def test_kimi_moe_leaves_routed_input_transform_to_runner():
     moe.experts.assert_called_once()
     call_kwargs = moe.experts.call_args.kwargs
     torch.testing.assert_close(call_kwargs["hidden_states"], hidden_states)
-    torch.testing.assert_close(call_kwargs["router_logits"], router_logits)
+    # The gate runs inside the MoE op; the model only forwards a placeholder.
+    torch.testing.assert_close(call_kwargs["router_logits"], hidden_states)
+    gate.assert_not_called()
     torch.testing.assert_close(result, output)
+
+
+@pytest.mark.parametrize("hidden_act", ["silu", "situ"])
+def test_kimi_moe_enables_shared_expert_gate_up_core_limit(monkeypatch, hidden_act):
+    gate = SimpleNamespace()
+    shared_experts = SimpleNamespace()
+    experts = nn.Identity()
+    fused_moe_factory = MagicMock(return_value=experts)
+    monkeypatch.setattr(kimi_k3, "AscendKimiGateLinear", MagicMock(return_value=gate))
+    monkeypatch.setattr(kimi_k3, "KimiMLP", MagicMock(return_value=shared_experts))
+    monkeypatch.setattr(kimi_k3, "FusedMoEFactory", fused_moe_factory)
+    config = SimpleNamespace(
+        hidden_size=4,
+        moe_intermediate_size=8,
+        num_experts=16,
+        num_experts_per_token=2,
+        routed_expert_hidden_size=None,
+        latent_moe_use_norm=False,
+        routed_scaling_factor=1.0,
+        num_shared_experts=1,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        hidden_act=hidden_act,
+        moe_renormalize=True,
+        use_grouped_topk=False,
+        num_expert_group=None,
+        topk_group=None,
+        moe_router_activation_func="sigmoid",
+    )
+
+    moe = kimi_k3.AscendKimiMoE(config=config)
+
+    assert moe.experts is experts
+    assert fused_moe_factory.call_args.kwargs["runner_args"] == {
+        "shared_expert_gate_up_core_limit": (16, 32),
+        "shared_expert_sparse_situ": hidden_act == "situ",
+    }
 
 
 def test_ascend_attn_res_matches_canonical_k3_math():
@@ -158,8 +199,8 @@ def test_kimi_dense_mlp_gathers_and_scatters_sequence_shards(monkeypatch):
         calls.append(("mlp", hidden_states.clone()))
         return hidden_states + 1
 
-    def fake_reduce_scatter(hidden_states):
-        calls.append(("reduce_scatter", hidden_states.clone()))
+    def fake_reduce_scatter(hidden_states, *, use_attn_group=False):
+        calls.append(("reduce_scatter", hidden_states.clone(), use_attn_group))
         return hidden_states.chunk(2, dim=0)[0]
 
     monkeypatch.setattr(kimi_k3, "sp_all_gather", fake_all_gather)
@@ -168,9 +209,25 @@ def test_kimi_dense_mlp_gathers_and_scatters_sequence_shards(monkeypatch):
 
     output = mlp(torch.tensor([[1.0], [2.0]]))
 
-    assert [name for name, _ in calls] == ["gather", "mlp", "reduce_scatter"]
+    assert [entry[0] for entry in calls] == ["gather", "mlp", "reduce_scatter"]
+    assert calls[2][2] is False
     torch.testing.assert_close(calls[1][1], torch.tensor([[1.0], [2.0], [11.0], [12.0]]))
     torch.testing.assert_close(output, torch.tensor([[2.0], [3.0]]))
+
+
+def test_sequence_reduce_scatter_skips_empty_padding(monkeypatch):
+    monkeypatch.setattr(sequence_parallel, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(sequence_parallel, "_custom_collective", lambda _name, tensor: tensor)
+
+    def unexpected_cat(*_args, **_kwargs):
+        raise AssertionError("aligned sequence-parallel input must not be concatenated")
+
+    monkeypatch.setattr(sequence_parallel.torch, "cat", unexpected_cat)
+    hidden_states = torch.ones(4, 8)
+
+    output = sequence_parallel.sp_attn_reduce_scatter(hidden_states)
+
+    torch.testing.assert_close(output, hidden_states)
 
 
 def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
@@ -200,11 +257,11 @@ def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
         return torch.cat((hidden_states, hidden_states), dim=0)
 
     def fake_reduce_scatter(hidden_states):
-        collective_shapes.append(("reduce_scatter", hidden_states.shape))
+        collective_shapes.append(("reduce_scatter", hidden_states.shape, True))
         return hidden_states.chunk(2, dim=0)[0]
 
     monkeypatch.setattr(kimi_k3, "sp_all_gather", fake_all_gather)
-    monkeypatch.setattr(kimi_k3, "sp_reduce_scatter", fake_reduce_scatter)
+    monkeypatch.setattr(kimi_k3, "sp_attn_reduce_scatter", fake_reduce_scatter)
     monkeypatch.setattr(
         kimi_k3,
         "_apply_ascend_attn_res",
@@ -221,7 +278,7 @@ def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
 
     assert collective_shapes == [
         ("gather", torch.Size([2, 2])),
-        ("reduce_scatter", torch.Size([3, 2])),
+        ("reduce_scatter", torch.Size([3, 2]), True),
     ]
     assert output.shape == torch.Size([2, 2])
     assert returned_residual.shape == torch.Size([2, 1, 2])

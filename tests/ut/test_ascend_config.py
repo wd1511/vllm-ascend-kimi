@@ -166,6 +166,19 @@ class TestAscendConfig(TestBase):
         self.assertFalse(config.scheduler_config.short_request_first_config.enabled)
         self.assertFalse(config.rl_config.enabled)
 
+    def test_kimi_decode_shared_core_limit(self):
+        kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}
+        self.assertEqual(AscendConfig(**kwargs).kimi_k3_decode_shared_gate_up_core_limit, (32, 1))
+        self.assertEqual(
+            AscendConfig(
+                **kwargs, kimi_k3_decode_shared_gate_up_core_limit=[16, 32]
+            ).kimi_k3_decode_shared_gate_up_core_limit,
+            (16, 32),
+        )
+        for invalid in ((0, 1), (33, 1), (32, 0), (32, 65), (32,), (32, 1, 1)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                AscendConfig(**kwargs, kimi_k3_decode_shared_gate_up_core_limit=invalid)
+
     def test_eplb_load_collection_phase_defaults_to_all(self):
         self.assertEqual(EplbConfig().load_collection_phase, "all")
 
@@ -198,6 +211,22 @@ class TestAscendConfig(TestBase):
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertFalse(ascend_config.rl_config.enabled)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_enable_flash_mla_switch(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        # Default keeps the prolog+FlashMLA path on.
+        with patch.dict(os.environ, {}, clear=True):
+            ascend_config = init_ascend_config(test_vllm_config)
+            self.assertTrue(ascend_config.enable_flash_mla)
+
+        # Explicit opt-out routes every layer through the legacy MLA path.
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"enable_flash_mla": False}
+        with patch.dict(os.environ, {}, clear=True):
+            ascend_config = init_ascend_config(test_vllm_config)
+            self.assertFalse(ascend_config.enable_flash_mla)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -1037,6 +1066,43 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         # The rollback forces _MEGA_MOE_SUPPORTED=False, so the fused path
         # routes to dispatch_ffn_combine instead of mega_moe.
         self.assertFalse(is_mega_moe_supported())
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_fused_mc2_keeps_a3_multistream_mutex(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1, "multistream_overlap_shared_expert": True}
+
+        config = init_ascend_config(vc)
+
+        self.assertFalse(is_mega_moe_supported())
+        self.assertFalse(config.multistream_overlap_shared_expert)
+
+    @_clean_up
+    @patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=object())
+    @patch.object(AscendConfig, "_is_megamoe_supported_by_config", return_value=True)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_mega_moe_keeps_shared_expert_multistream(self, mock_fix, mock_megamoe_supported, mock_find_spec):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 2, "multistream_overlap_shared_expert": True}
+
+        config = init_ascend_config(vc)
+
+        self.assertEqual(config.enable_fused_mc2, 1)
+        self.assertTrue(is_mega_moe_supported())
+        self.assertTrue(config.multistream_overlap_shared_expert)
+
+    @_clean_up
+    @patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=None)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_mega_moe_missing_keeps_a3_multistream_mutex(self, mock_fix, mock_find_spec):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 2, "multistream_overlap_shared_expert": True}
+
+        config = init_ascend_config(vc)
+
+        self.assertFalse(is_mega_moe_supported())
+        self.assertFalse(config.multistream_overlap_shared_expert)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

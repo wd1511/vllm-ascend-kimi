@@ -24,10 +24,10 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, preserve_moe_router_dtype
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
-from vllm_ascend.utils import FP8_METHOD
+from vllm_ascend.utils import FP8_METHOD, AscendDeviceType, get_ascend_device_type
 
 from ..base import (
     AscendLinearScheme,
@@ -153,9 +153,25 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         topk_ids: torch.Tensor,
         shared_experts: Any | None,
         shared_experts_input: torch.Tensor | None,
+        shared_expert_schedule=None,
     ) -> torch.Tensor:
-        if x.dtype not in [torch.float8_e4m3fn]:
+        if not preserve_moe_router_dtype() and x.dtype not in [torch.float8_e4m3fn]:
             topk_weights = topk_weights.to(x.dtype)
+
+        if (
+            not self.dynamic_eplb
+            and _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
+            and get_ascend_device_type() == AscendDeviceType.A5
+        ):
+            w1 = layer.w13_weight.transpose(1, 2)
+            w2 = layer.w2_weight.transpose(1, 2)
+            w1_scale = layer.w13_weight_scale.transpose(1, 2)
+            w2_scale = layer.w2_weight_scale.transpose(1, 2)
+        else:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         return moe_comm_method.fused_experts(
@@ -163,8 +179,8 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
+                w1=w1,
+                w2=w2,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=layer.ascend_expert_map,
@@ -178,9 +194,12 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_scale_dtype=torch_npu.float8_e8m0fnu,
                 mxfp_per_token_scale_dtype=torch_npu.float8_e8m0fnu,
                 mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-            )
+                mxfp_group_size=self.group_size,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                shared_weights=shared_experts,
+            ),
+            **({} if shared_expert_schedule is None else {"shared_expert_schedule": shared_expert_schedule}),
         )
 
     def process_weights_after_loading(self, layer):

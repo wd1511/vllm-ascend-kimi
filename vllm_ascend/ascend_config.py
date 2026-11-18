@@ -33,6 +33,29 @@ if TYPE_CHECKING:
 _MEGA_MOE_SUPPORTED = None
 
 
+def compute_mega_moe_buffer_tokens_per_rank(
+    mega_moe_max_tokens: int,
+    execution_tokens_per_rank: int,
+    expert_parallel_size: int,
+) -> int:
+    """Compute the per-rank token capacity for the A5 MegaMoE buffer."""
+    if execution_tokens_per_rank <= 0:
+        raise ValueError(f"execution_tokens_per_rank must be positive, got {execution_tokens_per_rank}")
+    if expert_parallel_size <= 0:
+        raise ValueError(f"expert_parallel_size must be positive, got {expert_parallel_size}")
+
+    configured_tokens_per_rank = mega_moe_max_tokens // expert_parallel_size
+    buffer_tokens_per_rank = min(configured_tokens_per_rank, execution_tokens_per_rank)
+    if buffer_tokens_per_rank <= 0:
+        raise ValueError(
+            "MegaMoE per-rank token capacity must be positive: "
+            f"mega_moe_max_tokens={mega_moe_max_tokens}, "
+            f"execution_tokens_per_rank={execution_tokens_per_rank}, "
+            f"expert_parallel_size={expert_parallel_size}."
+        )
+    return buffer_tokens_per_rank
+
+
 def is_mega_moe_supported() -> bool:
     """Whether the megamoe op is available at runtime.
 
@@ -259,14 +282,17 @@ class AscendConfig:
             "enable_dsa_cp": false,
             "draft_window_size": null,
             "mix_placement": false,
+            "enable_mega_kda": false,
             "pa_shape_list": [],
             "mega_moe_max_tokens": 65536,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "c8_enable_reshape_optim": false,
+            "enable_flash_mla": true,
             "enable_fused_mc2": 0,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
+            "profiler_decode_only": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
             "enable_shared_expert_dp": false,
@@ -387,16 +413,27 @@ class AscendConfig:
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
+    # Kimi BF16 shared gate/up in split MC2 decode only: (AIC, AIV).
+    # Use (16, 32) to compare against PR48; quantized/prefill paths are unchanged.
+    kimi_k3_decode_shared_gate_up_core_limit: tuple[int, int] = (32, 1)
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
+    # Fuse the Kimi K3 KDA decode/verify step (input projections, causal
+    # conv1d update, recurrent KDA, gated output norm and output projection)
+    # into the external ops.mega_recurrent_kda operator. Requires the
+    # cannbot-arena ``ops`` package, BF16 (unquantized) KDA projections, and
+    # Non-prefill decode batches with dimensions supported by the installed
+    # operator. Batch and sequence dimensions are supplied at runtime;
+    # prefill uses the standard decode path.
+    enable_mega_kda: bool = False
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
-    # Per-rank token capacity after dispatch in the fused MC2/MegaMoe path.
-    # The same value is passed as dispatch_ffn_combine's max_output_size
-    # and CANN MegaMoe buffer's max_recv_token_num.
+    # Global token ceiling for dispatch_ffn_combine. A5 MegaMoE derives its
+    # per-rank symmetric-buffer capacity from this ceiling and the current
+    # process's MC2 execution capacity.
     # This is a reference value: if the actual per-rank received token
     # count exceeds it, tokens may be truncated, causing precision
     # degradation. Do not set it too large because workspace memory scales
@@ -408,6 +445,15 @@ class AscendConfig:
     dump_config_path: str | None = None
     c8_enable_reshape_optim: bool = False
     mc2_comm_alg: Literal["", "fullmesh", "hierarchy", "fullmesh_v2"] = ""
+    # Master switch for the Kimi K3 prolog+FlashMLA path (fused Q/KV down
+    # projection, merged single PA_NZ cache, FlashMLA decode). Disabling it
+    # allocates the legacy two-cache layout and routes every layer through
+    # the standard MLA prefill/decode -- for A/B comparison and fallback.
+    # Structural (controls the cache shape), startup-only. Default True.
+    enable_flash_mla: bool = True
+    # Build FlashMLA metadata on a dedicated NPU stream and synchronize it
+    # with the main attention stream.
+    enable_multi_streams: bool = False
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
@@ -419,6 +465,7 @@ class AscendConfig:
     # existing memory-saving behavior).
     mlapo_keep_prefill_weights: bool = False
     msmonitor_use_daemon: bool = False
+    profiler_decode_only: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
 
@@ -454,6 +501,9 @@ class AscendConfig:
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        aic, aiv = self.kimi_k3_decode_shared_gate_up_core_limit
+        if not (1 <= aic <= 32 and 1 <= aiv <= 64):
+            raise ValueError("kimi_k3_decode_shared_gate_up_core_limit requires AIC in [1, 32], AIV in [1, 64]")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -614,14 +664,16 @@ class AscendConfig:
                 "only guaranteed when the recompute scheduler is enabled."
             )
 
-        # enable_fused_mc2 enum + MiniMax mutex + multistream auto-disable
+        # enable_fused_mc2 enum + MiniMax mutex + A3 multistream auto-disable
         assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
         model_architectures = getattr(vc.model_config, "architectures", None) or []
         assert not (
             self.enable_fused_mc2 == 1
             and any(architecture.startswith("MiniMaxM3") for architecture in model_architectures)
         ), "MiniMax M3 does not support enable_fused_mc2=1. Please set additional_config.enable_fused_mc2 to 0."
-        if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
+        # MegaMoE uses its own communicator; keep the original restriction for
+        # dispatch_ffn_combine, including when MegaMoE is unavailable.
+        if self.enable_fused_mc2 == 1 and not _MEGA_MOE_SUPPORTED and self.multistream_overlap_shared_expert:
             self.multistream_overlap_shared_expert = False
             logger.warning_once(
                 "enable_fused_mc2 and multistream_overlap_shared_expert "
@@ -734,8 +786,25 @@ class AscendConfig:
         self._check_mix_placement()
 
         # sparse KV offload vs sparse SFA C8 main cache mutex
+        self._validate_mega_kda(vllm_config)
         self._validate_sparse_c8_kv_offload_compatibility()
         return self
+
+    def _validate_mega_kda(self, vllm_config: VllmConfig) -> None:
+        """Validate enable_mega_kda against the model configuration."""
+        if not self.enable_mega_kda:
+            return
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        linear_attn = getattr(hf_config, "linear_attn_config", None)
+        if not isinstance(linear_attn, dict) or "num_heads" not in linear_attn:
+            raise ValueError(
+                "additional_config.enable_mega_kda requires a Kimi K3 model with KDA (linear attention) layers."
+            )
+        if not linear_attn.get("use_full_rank_gate", False):
+            raise ValueError(
+                "additional_config.enable_mega_kda requires a full-rank KDA "
+                "output gate (linear_attn_config.use_full_rank_gate)."
+            )
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile

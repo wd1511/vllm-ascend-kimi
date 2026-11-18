@@ -22,13 +22,115 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.utils import AscendDeviceType
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    DP_METADATA_FIELD_COUNT,
+    DP_METADATA_HAS_DECODE,
+    DP_METADATA_HAS_REAL_WORK,
+    DP_METADATA_NUM_TOKENS,
+    NPUModelRunner,
+    _post_process_batch_contains_decode,
+)
+
+
+class TestDPDecodeMetadata(unittest.TestCase):
+    def test_pd_dummy_does_not_set_decode_flag_or_inflate_moe_token_count(self):
+        for active_has_decode in (False, True):
+            packed = torch.zeros(DP_METADATA_FIELD_COUNT, 2, dtype=torch.int32)
+            packed[DP_METADATA_NUM_TOKENS] = torch.tensor([4, 1])
+            packed[DP_METADATA_HAS_REAL_WORK] = torch.tensor([1, 0])
+            packed[DP_METADATA_HAS_DECODE] = torch.tensor([int(active_has_decode), int(not active_has_decode)])
+
+            for rank, is_dummy in ((0, False), (1, True)):
+                with self.subTest(active_has_decode=active_has_decode, rank=rank):
+                    runner = NPUModelRunner.__new__(NPUModelRunner)
+                    runner.dp_size = 2
+                    runner.dp_rank = rank
+                    runner.vllm_config = SimpleNamespace()
+                    runner.ascend_config = SimpleNamespace(enable_fused_mc2=1)
+                    with (
+                        patch(
+                            "vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group",
+                            return_value=False,
+                        ),
+                        patch(
+                            "vllm_ascend.worker.model_runner_v1.get_dp_group",
+                            return_value=SimpleNamespace(cpu_group=None),
+                        ),
+                        patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce"),
+                        patch("vllm_ascend.worker.model_runner_v1.torch.zeros", return_value=packed.clone()) as zeros,
+                        patch("vllm_ascend.worker.model_runner_v1.is_950", return_value=True),
+                    ):
+                        max_tokens, tokens_across_dp, synced_mode = runner._sync_metadata_across_dp(
+                            num_tokens=int(packed[DP_METADATA_NUM_TOKENS, rank]),
+                            cudagraph_mode=CUDAGraphMode.NONE,
+                            allow_dp_padding=True,
+                            is_dummy_run=is_dummy,
+                            batch_contains_decode=bool(packed[DP_METADATA_HAS_DECODE, rank]),
+                        )
+
+                    zeros.assert_called_once_with(DP_METADATA_FIELD_COUNT, 2, device="cpu", dtype=torch.int32)
+                    self.assertEqual(max_tokens, 4)
+                    self.assertEqual(tokens_across_dp.tolist(), [4, 4])
+                    self.assertEqual(synced_mode, CUDAGraphMode.NONE)
+                    self.assertEqual(runner._synced_batch_contains_decode, active_has_decode)
+
+    def test_mega_moe_disabled_uses_original_dp_metadata_layout(self):
+        packed = torch.tensor(
+            [[4, 9], [CUDAGraphMode.FULL.value, CUDAGraphMode.NONE.value]], dtype=torch.int32
+        )
+        for enabled, a5 in ((0, True), (1, False)):
+            for rank in range(2):
+                with self.subTest(enabled=enabled, a5=a5, rank=rank):
+                    runner = NPUModelRunner.__new__(NPUModelRunner)
+                    runner.dp_size = 2
+                    runner.dp_rank = rank
+                    runner.vllm_config = SimpleNamespace()
+                    runner.ascend_config = SimpleNamespace(enable_fused_mc2=enabled)
+                    with (
+                        patch(
+                            "vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group",
+                            return_value=False,
+                        ),
+                        patch(
+                            "vllm_ascend.worker.model_runner_v1.get_dp_group",
+                            return_value=SimpleNamespace(cpu_group=None),
+                        ),
+                        patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce"),
+                        patch("vllm_ascend.worker.model_runner_v1.torch.zeros", return_value=packed.clone()) as zeros,
+                        patch("vllm_ascend.worker.model_runner_v1.is_950", return_value=a5),
+                    ):
+                        max_tokens, tokens_across_dp, synced_mode = runner._sync_metadata_across_dp(
+                            num_tokens=int(packed[DP_METADATA_NUM_TOKENS, rank]),
+                            cudagraph_mode=CUDAGraphMode.FULL if rank == 0 else CUDAGraphMode.NONE,
+                            is_dummy_run=rank == 1,
+                            batch_contains_decode=True,
+                        )
+
+                    zeros.assert_called_once_with(2, 2, device="cpu", dtype=torch.int32)
+                    self.assertEqual(max_tokens, 9)
+                    self.assertEqual(tokens_across_dp.tolist(), [4, 9])
+                    self.assertEqual(synced_mode, CUDAGraphMode.NONE)
+
+    def test_active_decode_rank_forces_fallback(self):
+        packed = torch.zeros(DP_METADATA_FIELD_COUNT, 3, dtype=torch.int32)
+        packed[DP_METADATA_HAS_DECODE] = torch.tensor([0, 1, 1])
+        active_mask = torch.tensor([True, True, False])
+
+        self.assertTrue(_post_process_batch_contains_decode(packed, active_mask))
+
+    def test_dummy_decode_rank_is_ignored(self):
+        packed = torch.zeros(DP_METADATA_FIELD_COUNT, 3, dtype=torch.int32)
+        packed[DP_METADATA_HAS_DECODE] = torch.tensor([0, 0, 1])
+        active_mask = torch.tensor([True, True, False])
+
+        self.assertFalse(_post_process_batch_contains_decode(packed, active_mask))
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):
@@ -172,6 +274,72 @@ class TestDeviceMetadataFullGraphEvents(unittest.TestCase):
             runner._dummy_run(4, cudagraph_runtime_mode=CUDAGraphMode.FULL, is_graph_capturing=True)
 
         self.assertEqual(events, ["context_enter", "forward", "context_exit", "release"])
+
+
+class TestMegaMoEBufferProfiling(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.ascend_config = SimpleNamespace(enable_fused_mc2=1)
+        runner.max_num_tokens = 8192
+        runner.vllm_config = object()
+        runner.model = object()
+        runner._dummy_run = MagicMock()
+        return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_a5_mega_moe_buffer_tokens_per_rank", return_value=256)
+    @patch("vllm_ascend.worker.model_runner_v1.get_a5_moe_sp_size", return_value=8)
+    @patch("vllm_ascend.worker.model_runner_v1.select_moe_comm_method")
+    def test_profiles_eligible_smaller_batch_before_kv_cache(
+        self,
+        select_moe_comm_method,
+        _get_sp_size,
+        _get_buffer_tokens,
+    ):
+        runner = self._build_runner()
+        select_moe_comm_method.side_effect = [MoECommType.MC2, MoECommType.FUSED_MC2]
+
+        runner._profile_mega_moe_buffer()
+
+        runner._dummy_run.assert_called_once_with(2048, with_prefill=True, is_profile=True)
+        self.assertEqual(
+            [mock_call.args[0] for mock_call in select_moe_comm_method.call_args_list],
+            [8192, 2048],
+        )
+        for mock_call in select_moe_comm_method.call_args_list:
+            self.assertIs(mock_call.kwargs["model_instance"], runner.model)
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_a5_mega_moe_buffer_tokens_per_rank", return_value=256)
+    @patch("vllm_ascend.worker.model_runner_v1.get_a5_moe_sp_size", return_value=8)
+    @patch("vllm_ascend.worker.model_runner_v1.select_moe_comm_method")
+    def test_decode_path_does_not_profile_mega_moe_buffer(
+        self,
+        select_moe_comm_method,
+        _get_sp_size,
+        _get_buffer_tokens,
+    ):
+        runner = self._build_runner()
+        select_moe_comm_method.side_effect = [MoECommType.MC2, MoECommType.MC2]
+
+        runner._profile_mega_moe_buffer()
+
+        runner._dummy_run.assert_not_called()
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_a5_mega_moe_buffer_tokens_per_rank")
+    @patch("vllm_ascend.worker.model_runner_v1.get_a5_moe_sp_size")
+    @patch("vllm_ascend.worker.model_runner_v1.select_moe_comm_method", return_value=MoECommType.FUSED_MC2)
+    def test_regular_profile_avoids_duplicate_mega_moe_warmup(
+        self,
+        _select_moe_comm_method,
+        get_sp_size,
+        get_buffer_tokens,
+    ):
+        runner = self._build_runner()
+
+        runner._profile_mega_moe_buffer()
+
+        runner._dummy_run.assert_not_called()
+        get_sp_size.assert_not_called()
+        get_buffer_tokens.assert_not_called()
 
 
 class TestDSparkAuxCaptureMode(unittest.TestCase):

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -30,12 +31,14 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInp
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
+from vllm_ascend.ops.fused_moe.mega_moe import MegaMoEBackend
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
     PrepareAndFinalizeWithAllGather,
     PrepareAndFinalizeWithMC2,
+    PrepareAndFinalizeWithMegaMoE,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher,
@@ -44,6 +47,31 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+
+def _prefer_expert_token_counts_for_situ(moe_config: FusedMoEConfig, fused_input: MoEFusedExpertsInput) -> bool:
+    if (
+        get_ascend_device_type() != AscendDeviceType.A5
+        or moe_config.activation != MoEActivation.SITU
+        or fused_input.lora_context is not None
+        or fused_input.dynamic_eplb
+    ):
+        return False
+
+    beta = moe_config.activation_situ_beta
+    alpha = moe_config.activation_situ_linear_beta
+    if (beta is not None and beta <= 0) or alpha is None or alpha <= 0:
+        return False
+
+    if fused_input.quant.quant_type == QuantType.W4A8MXFP:
+        return not fused_input.quant.is_per_channel_weight and hasattr(torch.ops.custom, "grouped_situ_mx_quant")
+    if fused_input.quant.quant_type == QuantType.NONE:
+        return fused_input.hidden_states.dtype in (torch.float16, torch.bfloat16) and hasattr(
+            torch.ops.custom, "npu_situ_and_mul_sparse"
+        )
+    return False
+
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
@@ -69,11 +97,15 @@ class FusedExpertsResult:
     # communication method that supports shared experts in parallel with routed
     # experts.
     before_dispatch_evt: torch.npu.Event | None = None
+    after_dispatch_evt: torch.npu.Event | None = None
+    # Completion of the routed GMM1 when the activation runs as a separate op.
+    after_gmm1_evt: torch.npu.Event | None = None
     before_gmm2_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
+    shared_experts_fused: bool = False
 
 
 class MoECommMethod(ABC):
@@ -117,6 +149,7 @@ class MoECommMethod(ABC):
     def fused_experts(
         self,
         fused_experts_input: MoEFusedExpertsInput,
+        shared_expert_schedule=None,
     ):
         # Check constraints
         assert fused_experts_input.hidden_states.dtype in [
@@ -135,8 +168,13 @@ class MoECommMethod(ABC):
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
+            prefer_expert_token_counts=isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+            and _prefer_expert_token_counts_for_situ(self.moe_config, fused_experts_input),
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        after_dispatch_evt = torch.npu.current_stream().record_event()
+        if shared_expert_schedule is not None:
+            shared_expert_schedule.after_dispatch(before_dispatch_evt, after_dispatch_evt)
 
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
@@ -144,7 +182,13 @@ class MoECommMethod(ABC):
             moe_config=self.moe_config,
         )
 
-        mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
+        if shared_expert_schedule is None:
+            mlp_output, before_gmm2_evt, after_gmm1_evt = self._apply_mlp(mlp_compute_input)
+        else:
+            mlp_output, before_gmm2_evt, after_gmm1_evt = unified_apply_mlp(
+                mlp_compute_input=mlp_compute_input,
+                after_gmm1=shared_expert_schedule.after_gmm1,
+            )
 
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
@@ -155,13 +199,17 @@ class MoECommMethod(ABC):
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
+            after_dispatch_evt=after_dispatch_evt,
+            after_gmm1_evt=after_gmm1_evt,
             before_gmm2_evt=before_gmm2_evt,
             before_combine_evt=before_combine_evt,
             group_list_type=token_dispatch_output.group_list_type,
             expert_tokens=token_dispatch_output.group_list,
         )
 
-    def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
+    def _apply_mlp(
+        self, mlp_compute_input: MoEMlpComputeInput
+    ) -> tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None]:
         return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
 
     @abstractmethod
@@ -247,6 +295,14 @@ class AlltoAllCommImpl(MoECommMethod):
         return PrepareAndFinalizeWithAll2All(self.moe_config)
 
 
+class _MegaMoEBypassTokenDispatcher(MoETokenDispatcher[None]):
+    def token_dispatch(self, token_dispatch_input):
+        raise RuntimeError("A5 MegaMoE bypasses token_dispatch; use MegaMoEBackend.fused_experts instead.")
+
+    def token_combine(self, hidden_states, combine_metadata, bias=None):
+        raise RuntimeError("A5 MegaMoE bypasses token_combine; use MegaMoEBackend.fused_experts instead.")
+
+
 class FusedMC2CommImpl(MoECommMethod):
     """This implementation is for the scenarios listed below:
     1. `enable_expert_parallel=True`.
@@ -259,11 +315,13 @@ class FusedMC2CommImpl(MoECommMethod):
 
     def __init__(self, moe_config):
         super().__init__(moe_config)
+        self._is_a5_backend = get_ascend_device_type() == AscendDeviceType.A5
+        self._mega_moe_backend = MegaMoEBackend(moe_config) if self._is_a5_backend else None
         self.enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if self.enable_fused_mc2 == 1 and is_mega_moe_supported():
+        if self.enable_fused_mc2 == 1 and not self._is_a5_backend and is_mega_moe_supported():
             self.mega_moe_symm_buffer = None
             self.get_symm_buffer_for_mega_moe, self.mega_moe = moe_utils.load_cann_mega_moe_ops()
-        if self.enable_fused_mc2 == 1:
+        if self.enable_fused_mc2 == 1 and not self._is_a5_backend:
             self.expert_token_nums = torch.zeros([self.moe_config.num_local_experts], dtype=torch.int32, device="npu")
         else:
             self.expert_token_nums = None
@@ -275,10 +333,21 @@ class FusedMC2CommImpl(MoECommMethod):
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
 
+    def supports_fused_shared_experts(self) -> bool:
+        return (
+            self._is_a5_backend
+            and self._mega_moe_backend is not None
+            and self._mega_moe_backend.supports_shared_experts()
+        )
+
     def _get_token_dispatcher(self):
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            return _MegaMoEBypassTokenDispatcher()
         return TokenDispatcherWithMC2()
 
     def _get_prepare_finalize(self):
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            return PrepareAndFinalizeWithMegaMoE(self.moe_config)
         return PrepareAndFinalizeWithMC2(self.moe_config)
 
     def _init_mega_moe_symm_buffer(
@@ -449,6 +518,15 @@ class FusedMC2CommImpl(MoECommMethod):
         self,
         fused_experts_input: MoEFusedExpertsInput,
     ):
+        if self._is_a5_backend:
+            assert self._mega_moe_backend is not None
+            out, expert_tokens, shared_experts_fused = self._mega_moe_backend.fused_experts(fused_experts_input)
+            return FusedExpertsResult(
+                routed_out=out,
+                expert_tokens=expert_tokens,
+                shared_experts_fused=shared_experts_fused,
+            )
+
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )

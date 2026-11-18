@@ -30,7 +30,13 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import Un
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    MoECommType,
+    cache_a5_moe_quant_type,
+    preserve_moe_router_dtype,
+    use_cann_megamoe,
+)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.lora.fused_moe import sync_lora_context
@@ -39,7 +45,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedEx
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.ops.fused_moe.shared_experts import FusedMoEEvents
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz, npu_stream_switch, router_stream
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -251,6 +257,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if not self._use_v2_model_runner:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
+        if self.quant_type != QuantType.NONE:
+            cache_a5_moe_quant_type(
+                vllm_config,
+                self.quant_type,
+            )
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         try:
@@ -475,9 +486,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             )
             topk_ids = torch.cat([topk_ids, shared_expert_ids], dim=1)
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
-        # MXFP4 packs activations as uint8; skip the cast so topk_weights stays
-        # fp32, which is what npu_moe_token_unpermute expects for its `probs` arg.
-        if hidden_states.dtype not in [torch.uint8, torch.float8_e4m3fn]:
+        # Preserve router precision for MC2 and packed activation formats.
+        if not preserve_moe_router_dtype() and hidden_states.dtype not in [torch.uint8, torch.float8_e4m3fn]:
             topk_weights = topk_weights.to(hidden_states.dtype)
         # This is a naive implementation for experts load balance so as to
         # avoid accumulating too much tokens on a single rank. It is only
@@ -492,12 +502,30 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
         return topk_weights, topk_ids
 
+    def _select_decode_experts(self, hidden_states, router_logits, pad_size, input_ids, enable_force_load_balance):
+        with npu_stream_switch(router_stream()):
+            if pad_size > 0:
+                router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, pad_size))
+            topk_weights, topk_ids = self._select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                enable_force_load_balance=enable_force_load_balance,
+                input_ids=input_ids,
+            )
+            router_topk_done = torch.npu.current_stream().record_event()
+        return topk_weights, topk_ids, router_topk_done
+
     def forward_impl(
         self,
         *,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_experts=None,
+        shared_experts_input: torch.Tensor | None = None,
+        router_state: tuple[torch.Tensor, torch.npu.Event] | None = None,
+        precomputed_topk: tuple[torch.Tensor, torch.Tensor, torch.npu.Event] | None = None,
+        shared_expert_schedule=None,
     ):
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice
@@ -513,26 +541,72 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if lora_context is not None:
             sync_lora_context(self.quant_method, lora_context)
 
-        prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            # The SP model wrapper already shards and gathers the MoE sequence.
-            replace_allreduce=self.moe_config.is_sequence_parallel,
-            quant_type=self.quant_type,
-        )
-        hidden_states = prepare_output.hidden_states
-        router_logits = prepare_output.router_logits
-        mc2_mask = prepare_output.mc2_mask
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
-        pertoken_scale = prepare_output.pertoken_scale
         if self.router is None:
             raise RuntimeError("AscendRoutedExperts requires a router for expert selection.")
-        topk_weights, topk_ids = self._select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            enable_force_load_balance=enable_force_load_balance,
-            input_ids=input_ids,
+        fast_router_path = (
+            router_state is not None
+            and _EXTRA_CTX.moe_comm_type == MoECommType.MC2
+            and self.moe_config.is_sequence_parallel
         )
+        if fast_router_path:
+            # Router multistream fast path (recipes router_stream): the
+            # router stream already ran the gate GEMM; continue [pad logits
+            # + expert selection] there while the main stream mirrors the
+            # SP branch of PrepareAndFinalizeWithMC2.prepare for the
+            # hidden/mask side, then join with the exact tail event before
+            # dispatch. Other comm types fall back to the shared path below.
+            router_logits = router_state[0]
+            # The MC2 padding/slicing state (tp_size/tp_rank/num_tokens/
+            # replace_allreduce) lives on the PrepareAndFinalizeWithMC2
+            # instance; MoECommMethod only wraps it via explicit delegation
+            # (no __getattr__), so the state must be set where finalize
+            # reads it.
+            prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
+            num_tokens = hidden_states.shape[0]
+            mc2_mask = _EXTRA_CTX.mc2_mask
+            mc2_mask = mc2_mask[prepare_finalize.tp_rank * num_tokens : (prepare_finalize.tp_rank + 1) * num_tokens]
+            pad_size = _EXTRA_CTX.padded_num_tokens // prepare_finalize.tp_size - num_tokens
+            if pad_size > 0:
+                hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
+                mc2_mask = torch.nn.functional.pad(mc2_mask, (0, pad_size), value=False)
+            padded_hidden_states_shape = hidden_states.shape
+            prepare_finalize.replace_allreduce = True
+            prepare_finalize.num_tokens = num_tokens
+            if precomputed_topk is not None:
+                topk_weights, topk_ids, router_topk_done = precomputed_topk
+            else:
+                topk_weights, topk_ids, router_topk_done = self._select_decode_experts(
+                    hidden_states, router_logits, pad_size, input_ids, enable_force_load_balance
+                )
+            main_stream = torch.npu.current_stream()
+            topk_weights.record_stream(main_stream)
+            topk_ids.record_stream(main_stream)
+            main_stream.wait_event(router_topk_done)
+            pertoken_scale = None
+        else:
+            if precomputed_topk is not None or shared_expert_schedule is not None:
+                raise RuntimeError("Precomputed routing and staged shared experts require the MC2 SP path.")
+            # The gate GEMM runs on the main stream (or its completion was
+            # already joined there), so the shared prepare can consume the
+            # logits directly.
+            prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                # The SP model wrapper already shards and gathers the MoE sequence.
+                replace_allreduce=self.moe_config.is_sequence_parallel,
+                quant_type=self.quant_type,
+            )
+            hidden_states = prepare_output.hidden_states
+            router_logits = prepare_output.router_logits
+            mc2_mask = prepare_output.mc2_mask
+            padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+            pertoken_scale = prepare_output.pertoken_scale
+            topk_weights, topk_ids = self._select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                enable_force_load_balance=enable_force_load_balance,
+                input_ids=input_ids,
+            )
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         try:
@@ -541,8 +615,9 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 x=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                **({} if shared_expert_schedule is None else {"shared_expert_schedule": shared_expert_schedule}),
             )
         finally:
             self.ascend_pertoken_scale = None
@@ -585,8 +660,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 before_routed_experts=None,
                 after_routed_experts=None,
                 before_dispatch=fused_experts_results.before_dispatch_evt,
+                after_dispatch=fused_experts_results.after_dispatch_evt,
+                after_gmm1=fused_experts_results.after_gmm1_evt,
                 before_gmm2=fused_experts_results.before_gmm2_evt,
                 before_combine=fused_experts_results.before_combine_evt,
+                shared_experts_fused=fused_experts_results.shared_experts_fused,
             )
 
         # The vLLM FusedMoE forward_impl does not return events.

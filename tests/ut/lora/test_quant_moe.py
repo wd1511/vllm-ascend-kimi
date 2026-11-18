@@ -94,7 +94,7 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
         patch(f"{QUANT_MOE}.torch.npu.current_stream", return_value=stream),
     ):
         extra_ctx.moe_comm_type = comm_type
-        output, output_event = quant_apply_mlp_with_moe_lora(mlp_compute_input=mlp_input)
+        output, output_event, _ = quant_apply_mlp_with_moe_lora(mlp_compute_input=mlp_input)
 
     assert output is down_out
     assert output_event is event
@@ -158,7 +158,7 @@ def test_dynamic_int8_all2all_lora_handles_empty_ep_rank() -> None:
         patch(f"{QUANT_MOE}.DeviceOperator.npu_dynamic_quant") as dynamic_quant,
     ):
         extra_ctx.moe_comm_type = MoECommType.ALLTOALL
-        output, output_event = quant_apply_mlp_with_moe_lora(mlp_compute_input=mlp_input)
+        output, output_event, _ = quant_apply_mlp_with_moe_lora(mlp_compute_input=mlp_input)
 
     assert output is mlp_input.hidden_states
     assert output_event is None

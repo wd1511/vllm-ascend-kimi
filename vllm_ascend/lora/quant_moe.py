@@ -40,7 +40,10 @@ from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAn
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
 
-QuantMoELoRAApply = Callable[[MoEMlpComputeInput], tuple[torch.Tensor, torch.npu.Event | None]]
+QuantMoELoRAApply = Callable[
+    [MoEMlpComputeInput],
+    tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None],
+]
 QuantMoELoRAActivationValidator = Callable[[torch.Tensor, torch.Tensor | None], None]
 
 
@@ -86,7 +89,7 @@ def _get_quant_moe_lora_impl(quant_type: QuantType) -> QuantMoELoRAImpl:
 def quant_apply_mlp_with_moe_lora(
     *,
     mlp_compute_input: MoEMlpComputeInput,
-) -> tuple[torch.Tensor, torch.npu.Event | None]:
+) -> tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None]:
     """Dispatch an active quantized MoE LoRA batch to its backend."""
     return _get_quant_moe_lora_impl(mlp_compute_input.quant.quant_type).apply(mlp_compute_input)
 
@@ -150,7 +153,7 @@ def _validate_dynamic_int8_activations(
 )
 def _apply_dynamic_int8_moe_lora(
     mlp_compute_input: MoEMlpComputeInput,
-) -> tuple[torch.Tensor, torch.npu.Event | None]:
+) -> tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None]:
     """Run INT8 base experts and inject LoRA at BF16/FP16 boundaries."""
     comm_type = _EXTRA_CTX.moe_comm_type
     if comm_type not in {MoECommType.ALLGATHER, MoECommType.ALLTOALL}:
@@ -175,7 +178,7 @@ def _apply_dynamic_int8_moe_lora(
     if hidden_states.shape[0] == 0:
         # An EP rank may receive no routed tokens. Keep participating in the
         # surrounding AlltoAll collectives, but avoid empty-tensor NPU kernels.
-        return hidden_states, None
+        return hidden_states, None, None
 
     weights = mlp_compute_input.weights
     if weights.w1_scale_bias is not None or weights.w2_scale_bias is not None:
@@ -270,7 +273,7 @@ def _apply_dynamic_int8_moe_lora(
         silu_out=activated,
         lora_routing=lora_routing,
     )
-    return down_out, before_gmm2_evt
+    return down_out, before_gmm2_evt, None
 
 
 __all__ = [

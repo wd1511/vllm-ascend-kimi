@@ -90,7 +90,23 @@ class TestMoECommMethod(TestBase):
         self.assertEqual(call_args.args[:4], ("mc2_group", 8, 128, 2))
         self.assertEqual(call_args.kwargs["max_recv_token_num"], 32768)
         mock_warning_once.assert_called_once()
-        self.assertIn("mega_moe_max_tokens", mock_warning_once.call_args.args[0])
+        self.assertIn("configured", mock_warning_once.call_args.args[0])
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.warning_once")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")
+    def test_mega_moe_symm_buffer_raises_config_to_safe_capacity(self, mock_get_mc2_group, mock_warning_once):
+        self.mock_ascend_config.mega_moe_max_tokens = 512
+        mock_mc2_group = MagicMock()
+        mock_mc2_group.device_group = "mc2_group"
+        mock_get_mc2_group.return_value = mock_mc2_group
+        comm_impl = self._make_fused_mc2_comm_for_buffer_init()
+
+        comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=False)
+
+        call_args = comm_impl.get_symm_buffer_for_mega_moe.call_args
+        # 128 input tokens/rank * 8 EP ranks * min(topk=2, experts/rank=1).
+        self.assertEqual(call_args.kwargs["max_recv_token_num"], 1024)
+        mock_warning_once.assert_called_once()
 
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.warning_once")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")

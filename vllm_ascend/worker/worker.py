@@ -21,6 +21,7 @@ import copy
 import gc
 import inspect
 import logging
+from contextlib import suppress
 from types import NoneType
 from typing import Any
 
@@ -81,6 +82,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.profiler.decode_filter import is_decode_only_batch
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     check_ascend_device_type,
@@ -650,6 +652,21 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        profiler = getattr(self, "profiler", None)
+        if profiler is not None:
+            if getattr(profiler, "decode_only", False) is True:
+                try:
+                    decode_only_step = is_decode_only_batch(scheduler_output)
+                except Exception:
+                    logger.exception("Failed to classify decode-only batch; skipping profiler step.")
+                    decode_only_step = False
+                if decode_only_step:
+                    profiler.step()
+                else:
+                    profiler.pause()
+            else:
+                profiler.step()
+
         self.log_memory_stats()
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:
@@ -676,9 +693,6 @@ class NPUWorker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
-
-        if self.profiler is not None:
-            self.profiler.step()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
@@ -1065,9 +1079,23 @@ class NPUWorker(WorkerBase):
 
             rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
             trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
+            decode_only = False
+            with suppress(RuntimeError):
+                decode_only = (
+                    getattr(get_ascend_config(), "profiler_decode_only", False) is True
+                    and self.profiler_config.profiler == "torch"
+                )
+            wrapper_kwargs: dict[str, bool] = {}
+            if decode_only:
+                trace_name = f"{trace_name}_decode_only"
+                wrapper_kwargs["decode_only"] = True
 
             if self.profiler is None:
-                self.profiler = TorchNPUProfilerWrapper(self.profiler_config, trace_name)
+                self.profiler = TorchNPUProfilerWrapper(
+                    self.profiler_config,
+                    trace_name,
+                    **wrapper_kwargs,
+                )
                 logger.debug("Starting torch profiler with trace name: %s", trace_name)
                 self.profiler.start()  # type: ignore[attr-defined]
             else:
@@ -1096,6 +1124,9 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        profiler = getattr(self, "profiler", None)
+        if profiler is not None and getattr(profiler, "decode_only", False) is True:
+            profiler.pause()
         self.log_memory_stats()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)

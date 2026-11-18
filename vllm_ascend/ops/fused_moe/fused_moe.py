@@ -16,26 +16,72 @@
 #
 import torch
 import torch.nn.functional as F
+import torch_npu
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import CompilationMode, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    _layer_name_type,
+    _moe_forward_shared,
+    _resolve_layer_name,
+    get_layer_from_name,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.ops.fused_moe.decode_overlap import ROUTER_CORE_LIMIT, DecodeSharedExpertSchedule
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRouter
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
     SharedExpertParallelMode,
 )
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
+    AscendW4A8MXFPDynamicFusedMoEMethod,
+    AscendW4A8MXFPDynamicLinearMethod,
+)
+from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    npu_stream_switch,
+    router_stream,
+    vllm_version_is,
+)
+
+
+def _ascend_kimi_moe_fake(
+    hidden_states: torch.Tensor, input_ids: torch.Tensor | None, layer_name: _layer_name_type
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def _ascend_kimi_moe(
+    hidden_states: torch.Tensor, input_ids: torch.Tensor | None, layer_name: _layer_name_type
+) -> torch.Tensor:
+    # Resolve once, like the upstream MoE op. Keep runtime phase selection and
+    # all stream orchestration opaque to Dynamo, but capturable by ACLGraph.
+    runner = get_layer_from_name(_resolve_layer_name(layer_name))
+    return runner._forward_kimi_moe(hidden_states, input_ids)
+
+
+direct_register_custom_op(
+    op_name="ascend_kimi_moe",
+    op_func=_ascend_kimi_moe,
+    fake_impl=_ascend_kimi_moe_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 def _ascend_moe_forward_shared_sp_fake(
@@ -67,11 +113,36 @@ def _ascend_moe_forward_shared_sp_fake(
     return shared_out, fused_out
 
 
+@eager_break_during_capture
+def _ascend_moe_forward_shared_sp(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: str,
+    hidden_dim_unpadded: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the shared-expert MoE path eagerly during graph capture.
+
+    The shared experts overlap their input gather, compute and output
+    collective on different NPU streams.  This orchestration is plain Python,
+    so it must not end up inside the captured graph, same as ``dsa_forward``.
+    """
+    return _moe_forward_shared(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        layer_name,
+        hidden_dim_unpadded,
+    )
+
+
 # Keep the gathered shared input as an explicit graph dependency, but expose
 # the SP-local shared output shape to torch.compile/ACL graph tracing.
 direct_register_custom_op(
     op_name="ascend_moe_forward_shared_sp",
-    op_func=_moe_forward_shared,
+    op_func=_ascend_moe_forward_shared_sp,
     fake_impl=_ascend_moe_forward_shared_sp_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
@@ -91,6 +162,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         routed_input_transform=None,
         routed_output_transform=None,
         routed_scaling_factor=1,
+        shared_expert_gate_up_core_limit: tuple[int, int] | None = None,
+        shared_expert_sparse_situ: bool = False,
     ):
         super().__init__(
             layer_name,
@@ -118,13 +191,28 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             self.moe_config.mc2_group = get_mc2_group()
 
         self.ascend_shared_experts = None
+        # The Kimi entry keeps its full-width input until latent projection.
+        self._kimi_gate = None
+        self._kimi_gate_multistream = False
+        self._decode_shared_gate_up_core_limit = getattr(
+            get_ascend_config(), "kimi_k3_decode_shared_gate_up_core_limit", ROUTER_CORE_LIMIT
+        )
         if shared_experts is not None:
+            vllm_config = get_current_vllm_config_or_none()
+            # A compiled output transform cannot safely own a Python stream
+            # wait for work launched inside the opaque MoE op. Join before
+            # returning from that op; only eager execution may defer the wait.
+            self._defer_sp_shared_output_wait = (
+                vllm_config is not None and vllm_config.compilation_config.mode == CompilationMode.NONE
+            )
             routed_experts.return_with_event = True
             self.ascend_shared_experts = AscendSharedExperts(
                 shared_experts,
                 self.moe_config,
                 self.quant_type,
                 self._quant_method,
+                gate_up_core_limit=shared_expert_gate_up_core_limit,
+                use_sparse_situ=shared_expert_sparse_situ,
             )
             if self._can_overlap_sp_shared_with(self.routed_input_transform):
                 self._forward_entry = torch.ops.vllm.ascend_moe_forward_shared_sp
@@ -139,6 +227,134 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     expert_ids_per_ep_rank,
                     persistent=False,
                 )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if getattr(self, "_kimi_gate_multistream", False) and shared_experts_input is None:
+            return torch.ops.vllm.ascend_kimi_moe(hidden_states, input_ids, self._encode_layer_name())
+        return super().forward(hidden_states, router_logits, input_ids, shared_experts_input)
+
+    def _can_run_decode_ladder(self, hidden_states: torch.Tensor) -> bool:
+        shared = self.ascend_shared_experts
+        if shared is None:
+            return False
+        shared_linears = (shared.layer.gate_up_proj, shared.layer.down_proj)
+        bf16_shared = all(
+            linear.weight.dtype == torch.bfloat16 and not hasattr(linear, "weight_scale") for linear in shared_linears
+        )
+        mxfp4_shared = all(
+            type(getattr(getattr(linear, "quant_method", None), "quant_method", None))
+            is AscendW4A8MXFPDynamicLinearMethod
+            and hasattr(linear, "weight_scale")
+            for linear in shared_linears
+        )
+        metadata = get_forward_context().attn_metadata
+        metadata = list(metadata.values()) if isinstance(metadata, dict) else [metadata]
+        # Missing or mixed/prefill metadata must not select the decode policy,
+        # even if enable_prefill_mc2 makes MC2 available for that batch.
+        decode_only = bool(metadata) and all(getattr(m, "num_prefills", None) == 0 for m in metadata)
+        down_scheme = getattr(getattr(self.routed_input_transform, "quant_method", None), "quant_method", None)
+        routed_scheme = getattr(self.routed_experts.quant_method, "quant_method", None)
+        return (
+            decode_only
+            and getattr(self, "_kimi_gate_multistream", False)
+            and _EXTRA_CTX.moe_comm_type is MoECommType.MC2
+            and get_ascend_device_type() is AscendDeviceType.A5
+            and self._can_overlap_sp_shared_with(self.routed_input_transform)
+            and self.moe_config.is_sequence_parallel
+            and hidden_states.dtype == torch.bfloat16
+            and type(down_scheme) is AscendW8A8MXFP8DynamicLinearMethod
+            and type(routed_scheme) is AscendW4A8MXFPDynamicFusedMoEMethod
+            and not self.routed_experts.dynamic_eplb
+            and getattr(self.routed_experts, "_ascend_moe_lora_context", None) is None
+            and type(self.routed_experts.router) is AscendFusedTopKRouter
+            and self.routed_experts.router.custom_routing_function is None
+            and self.routed_experts.router.tid2eid is None
+            and (bf16_shared or mxfp4_shared)
+            and shared.situ_activation is not None
+            and getattr(shared.layer, "expert_gate", None) is None
+            and str(getattr(self.moe_config.activation, "value", self.moe_config.activation)) == "situ"
+        )
+
+    def _forward_kimi_moe(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
+        # Match MoERunner.forward's projection/padding/reduction contract inside
+        # one opaque op. Its public output is always the original hidden width.
+        schedule = None
+        if self._can_run_decode_ladder(hidden_states):
+            routed_input, logits, routing, shared_input, gather_done = self._decode_kimi_front(hidden_states, input_ids)
+            routed_input, pre_trunc, post_trunc = self._maybe_pad_hidden_states(hidden_states, routed_input)
+            schedule = DecodeSharedExpertSchedule(
+                self.ascend_shared_experts,
+                shared_input[: _EXTRA_CTX.num_tokens],
+                gather_done,
+                self._decode_shared_gate_up_core_limit,
+                quantized_shared=hasattr(self.ascend_shared_experts.layer.gate_up_proj, "weight_scale"),
+            )
+            with self._sequence_parallel_context():
+                fused_output, _ = self.routed_experts.forward_impl(
+                    hidden_states=routed_input,
+                    router_logits=logits,
+                    input_ids=input_ids,
+                    router_state=(logits, routing[2]),
+                    precomputed_topk=routing,
+                    shared_expert_schedule=schedule,
+                )
+            shared_output = None
+        else:
+            routed_input, shared_input = self.apply_routed_input_transform(hidden_states)
+            routed_input, pre_trunc, post_trunc = self._maybe_pad_hidden_states(shared_input, routed_input)
+            result = self._forward_impl(routed_input, hidden_states, shared_input, input_ids)
+            shared_output, fused_output = result if isinstance(result, tuple) else (None, result)
+
+        if pre_trunc is not None:
+            fused_output = fused_output[..., :pre_trunc]
+        fused_output, reduced = self._maybe_reduce_routed_output_before_transform(
+            fused_output, self._fused_output_is_reduced
+        )
+        shared_output = self._maybe_reduce_shared_expert_output(shared_output, reduced)
+        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(shared_output, fused_output)
+        # The staged branch owns its output event; do not join a previous
+        # invocation's legacy shared-output stream in apply_routed_output_transform.
+        if schedule is not None:
+            fused_output = super().apply_routed_output_transform(fused_output)
+            shared_output = schedule.join()
+        else:
+            fused_output = self.apply_routed_output_transform(fused_output)
+        result = fused_output if shared_output is None else shared_output + fused_output
+        result = self._maybe_reduce_final_output(result, post_trunc, reduced)
+        return self._maybe_add_zero_expert_output(result)
+
+    def _decode_kimi_front(self, hidden_states, input_ids):
+        main_stream = torch.npu.current_stream()
+        shared_input, gather_done = self.ascend_shared_experts.start_input_all_gather(hidden_states)
+        self.ascend_shared_experts._pending_input_gather_evt = None
+        input_ready = main_stream.record_event()
+        hidden_states.record_stream(router_stream())
+        prepare = _EXTRA_CTX.moe_comm_method.prepare_finalize
+        pad_size = max(0, _EXTRA_CTX.padded_num_tokens // prepare.tp_size - hidden_states.shape[0])
+        with npu_stream_switch(router_stream()):
+            torch.npu.current_stream().wait_event(input_ready)
+            with torch_npu.npu.npugraph_ex.scope.limit_core_num(*ROUTER_CORE_LIMIT):
+                logits, _ = self._kimi_gate(hidden_states)
+            gate_done = torch.npu.current_stream().record_event()
+            # This exact router reads only shape/dtype from hidden_states.
+            # Keep the *projected and padded* metadata shape to preserve its
+            # fused-router eligibility without waiting for the projection.
+            routing_metadata = hidden_states.new_empty((hidden_states.shape[0] + pad_size, self.moe_config.hidden_dim))
+            routing = self.routed_experts._select_decode_experts(
+                routing_metadata, logits, pad_size, input_ids, _EXTRA_CTX.in_profile_run
+            )
+        scheme = self.routed_input_transform.quant_method.quant_method
+        quantized = scheme.quantize_input(hidden_states)
+        main_stream.wait_event(gate_done)
+        routed_input, _ = self.routed_input_transform(quantized)
+        # The routed entry joins TopK before dispatch. Down and TopK can overlap.
+        return routed_input, logits, routing, shared_input, gather_done
 
     @property
     def is_internal_router(self) -> bool:
@@ -171,6 +387,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             and shared_experts.multistream_overlap
             and shared_experts.parallel_mode() is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY
         )
+
+    def _should_defer_shared_output_wait(self) -> bool:
+        return self._can_overlap_sp_shared_with(self.routed_output_transform) and self._defer_sp_shared_output_wait
 
     @property
     def _fused_output_is_reduced(self) -> bool:
@@ -271,11 +490,105 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self.ascend_shared_experts is not None:
             self.ascend_shared_experts.set_lora_context(lora_context)
 
+    def _forward_with_fused_shared_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fuse a compatible shared expert without changing latent-MoE semantics."""
+        if self.ascend_shared_experts is None:
+            return None
+        # MegaMoE exposes one x for both routed and shared experts. Kimi K3's
+        # latent routed input differs from its full-width shared input, so it
+        # must retain the standalone shared path.
+        if shared_hidden_states is not hidden_states:
+            return None
+        get_shared_weights = getattr(self.ascend_shared_experts, "get_mega_moe_weights", None)
+        if get_shared_weights is None:
+            return None
+        if _EXTRA_CTX.moe_comm_type != MoECommType.FUSED_MC2:
+            return None
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        supports_fused_shared = getattr(moe_comm_method, "supports_fused_shared_experts", None)
+        if supports_fused_shared is None or not supports_fused_shared():
+            return None
+        shared_weights = get_shared_weights()
+        if shared_weights is None:
+            return None
+
+        if self.is_internal_router:
+            gate = self.gate
+            assert gate is not None
+            gate_weight = gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32)
+            router_logits = F.linear(shared_hidden_states.float(), gate_weight)
+
+        combined_out, fused_moe_events = self.routed_experts.forward_impl(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
+            shared_experts=shared_weights,
+            shared_experts_input=shared_hidden_states,
+        )
+        if not fused_moe_events.shared_experts_fused:
+            raise RuntimeError("MegaMoE returned without fusing the provided shared expert weights.")
+        # vLLM expects (shared, routed). MegaMoE has already summed both, so
+        # return the combined value in the shared slot and a zero routed slot.
+        return combined_out, torch.zeros_like(combined_out)
+
+    def _apply_kimi_front(self, hidden_states: torch.Tensor, routed_input: torch.Tensor | None = None):
+        """Gate GEMM + shared-input gather, inside the MoE op.
+
+        Keep stream orchestration inside the opaque MoE op. The normal runner
+        path projects routed inputs before upstream padding; direct callers
+        without a projected input still run the projection here.
+
+        ``hidden_states`` must be the pre-transform activations the gate was
+        built for. When upstream already ran the latent down projection before
+        the entry call, the transformed result is passed as ``routed_input``
+        so the projection is not applied twice.
+        """
+        shared_experts = self.ascend_shared_experts
+        gather_input = shared_experts is not None and self._can_overlap_sp_shared_with(self.routed_input_transform)
+        gathered = hidden_states
+        if gather_input:
+            gathered, _ = shared_experts.start_input_all_gather(hidden_states)
+
+        gate = getattr(self, "_kimi_gate", None)
+        fork_gate = (
+            getattr(self, "_kimi_gate_multistream", False)
+            and getattr(_EXTRA_CTX, "moe_comm_type", None) == MoECommType.MC2
+            and self.moe_config.is_sequence_parallel
+        )
+        gate_done = None
+        if fork_gate:
+            gate_ready = torch.npu.current_stream().record_event()
+            hidden_states.record_stream(router_stream())
+            with npu_stream_switch(router_stream()):
+                torch.npu.current_stream().wait_event(gate_ready)
+                router_logits, _ = gate(hidden_states)
+                gate_done = torch.npu.current_stream().record_event()
+            # Join the gate before handing its output to expert routing (or
+            # running the fallback projection for a direct caller).
+            torch.npu.current_stream().wait_event(gate_done)
+        else:
+            router_logits, _ = gate(hidden_states)
+
+        if routed_input is None:
+            routed_input, _ = super().apply_routed_input_transform(hidden_states)
+        return routed_input, router_logits, gate_done, gathered
+
     def apply_routed_input_transform(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Start the SP shared-input gather before the latent down projection."""
+        """Project before upstream padding, preserving full-width shared input."""
+        if getattr(self, "_kimi_gate", None) is not None:
+            # Upstream pads to the expert width before entering the MoE op.
+            # Project first: negative padding would otherwise crop the input.
+            routed_input, _ = super().apply_routed_input_transform(hidden_states)
+            return routed_input, hidden_states
         gathered_input = hidden_states
         all_gather_done = None
         shared_experts = self.ascend_shared_experts
@@ -284,7 +597,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             gathered_input, all_gather_done = shared_experts.start_input_all_gather(hidden_states)
         routed_input, shared_input = super().apply_routed_input_transform(hidden_states)
         if all_gather_done is not None:
-            torch.npu.current_stream().wait_event(all_gather_done)
+            # The shared compute stream joins this gather before consuming the
+            # result; waiting here would stall the routed input transform.
             shared_input = gathered_input
         return routed_input, shared_input
 
@@ -292,7 +606,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         """Run the latent up projection before joining the SP shared output."""
         fused_output = super().apply_routed_output_transform(fused_output)
         shared_experts = self.ascend_shared_experts
-        if self._can_overlap_sp_shared_with(self.routed_output_transform):
+        if self._should_defer_shared_output_wait():
             assert shared_experts is not None
             shared_experts.wait_for_output()
         return fused_output
@@ -306,6 +620,24 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             shared_experts_input: torch.Tensor | None,
             input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            # The Kimi K3 front stays outside the SP context, matching the
+            # previous placement in apply_routed_input_transform.
+            kimi_gate = getattr(self, "_kimi_gate", None)
+            router_state = None
+            if kimi_gate is not None:
+                # Upstream may apply the latent down projection before the entry
+                # call; the gate always consumes the pre-transform activations,
+                # which upstream then passes as shared_experts_input.
+                # Explicit original input marks the upstream transform contract;
+                # equal widths (including alignment padding) do not imply that
+                # the projection still needs to run.
+                front_input = shared_experts_input if shared_experts_input is not None else hidden_states
+                routed_input = hidden_states if shared_experts_input is not None else None
+                hidden_states, router_logits, gate_done, shared_experts_input = self._apply_kimi_front(
+                    front_input, routed_input
+                )
+                if gate_done is not None:
+                    router_state = (router_logits, gate_done)
             with self._sequence_parallel_context():
                 shared_hidden_states = shared_experts_input if shared_experts_input is not None else hidden_states
                 if self.ascend_shared_experts is None:
@@ -313,11 +645,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         hidden_states=hidden_states,
                         router_logits=router_logits,
                         input_ids=input_ids,
+                        router_state=router_state,
                     )
+                fused_shared_out = self._forward_with_fused_shared_experts(
+                    hidden_states,
+                    router_logits,
+                    shared_hidden_states,
+                    input_ids,
+                )
+                if fused_shared_out is not None:
+                    return fused_shared_out
                 # The runner input transform provides a padded gathered tensor
                 # in SP multistream mode. Trim the shared-MLP view before use.
                 shared_input_is_gathered = self._can_overlap_sp_shared_with(self.routed_input_transform)
-                defer_shared_output_wait = self._can_overlap_sp_shared_with(self.routed_output_transform)
+                defer_shared_output_wait = self._should_defer_shared_output_wait()
                 shared_expert_input = (
                     shared_hidden_states[: _EXTRA_CTX.num_tokens] if shared_input_is_gathered else shared_hidden_states
                 )
@@ -341,6 +682,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     input_ids=input_ids,
+                    router_state=router_state,
                 )
                 fused_moe_events.before_routed_experts = before_routed_experts
                 fused_moe_events.after_routed_experts = after_routed_experts
@@ -364,6 +706,24 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             shared_experts_input: torch.Tensor | None,
             input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            # The Kimi K3 front stays outside the SP context, matching the
+            # previous placement in apply_routed_input_transform.
+            kimi_gate = getattr(self, "_kimi_gate", None)
+            router_state = None
+            if kimi_gate is not None:
+                # Upstream may apply the latent down projection before the entry
+                # call; the gate always consumes the pre-transform activations,
+                # which upstream then passes as shared_experts_input.
+                # Explicit original input marks the upstream transform contract;
+                # equal widths (including alignment padding) do not imply that
+                # the projection still needs to run.
+                front_input = shared_experts_input if shared_experts_input is not None else hidden_states
+                routed_input = hidden_states if shared_experts_input is not None else None
+                hidden_states, router_logits, gate_done, shared_experts_input = self._apply_kimi_front(
+                    front_input, routed_input
+                )
+                if gate_done is not None:
+                    router_state = (router_logits, gate_done)
             with self._sequence_parallel_context():
                 shared_hidden_states = shared_experts_input if shared_experts_input is not None else hidden_states
                 if self.ascend_shared_experts is None:
@@ -379,10 +739,19 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         hidden_states=hidden_states,
                         router_logits=router_logits,
                         input_ids=input_ids,
+                        router_state=router_state,
                     )
+                fused_shared_out = self._forward_with_fused_shared_experts(
+                    hidden_states,
+                    router_logits,
+                    shared_hidden_states,
+                    input_ids,
+                )
+                if fused_shared_out is not None:
+                    return fused_shared_out
                 # See the v0.27.1 branch above for the input-shape contract.
                 shared_input_is_gathered = self._can_overlap_sp_shared_with(self.routed_input_transform)
-                defer_shared_output_wait = self._can_overlap_sp_shared_with(self.routed_output_transform)
+                defer_shared_output_wait = self._should_defer_shared_output_wait()
                 shared_expert_input = (
                     shared_hidden_states[: _EXTRA_CTX.num_tokens] if shared_input_is_gathered else shared_hidden_states
                 )
@@ -410,6 +779,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     input_ids=input_ids,
+                    router_state=router_state,
                 )
                 fused_moe_events.before_routed_experts = before_routed_experts
                 fused_moe_events.after_routed_experts = after_routed_experts

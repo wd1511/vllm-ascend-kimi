@@ -23,7 +23,7 @@ from vllm.config import get_current_vllm_config
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, preserve_moe_router_dtype, use_cann_megamoe
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
@@ -184,7 +184,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         lora_context = getattr(layer, "_ascend_moe_lora_context", None)
         assert topk_ids is not None
         assert topk_weights is not None
-        topk_weights = topk_weights.to(self.in_dtype)
+        if not preserve_moe_router_dtype():
+            topk_weights = topk_weights.to(self.in_dtype)
 
         activation = getattr(layer, "activation", "silu")
         act_name = getattr(activation, "value", activation)
