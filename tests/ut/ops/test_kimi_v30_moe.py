@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU SiTU replacement, event and core-limit regressions for ordinary MC2 overlap.
+"""CPU regressions for the 0.30 SiTU hooks and Decode dependency graph.
 
-Production functions are extracted from this checkout. NPU work is simulated.
+NPU kernels/streams are simulated; numerical SiTU reference runs on CPU.
 """
 
 import ast
 import unittest
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -19,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def load(path, names, ns, class_name=None):
+    ns.setdefault("moe_superkernel_scope", lambda *args: nullcontext())
+    ns.setdefault("get_ascend_config", lambda: NS(ascend_compilation_config=NS(enable_super_kernel=False)))
     tree = ast.parse((ROOT / path).read_text())
     if class_name:
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
@@ -67,9 +68,9 @@ class TestSituHooks(unittest.TestCase):
             QuantType=Quant,
             get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
             HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
-            cumsum_group_list=lambda counts, src, dst: (
-                counts if src == 1 else torch.diff(counts, prepend=counts.new_zeros(1))
-            ),
+            cumsum_group_list=lambda counts, src, dst: counts
+            if src == 1
+            else torch.diff(counts, prepend=counts.new_zeros(1)),
             _apply_situ=reference,
         )
         load("vllm_ascend/ops/fused_moe/moe_mlp.py", {"_unified_apply_activation"}, ns)
@@ -160,299 +161,27 @@ class TestSituHooks(unittest.TestCase):
         calls.clear()
         method.apply_gmm1_act_quant(inp)
         self.assertEqual(calls, ["gmm1", "legacy_situ"])
+        # After MegaMoE loading the dense weights were released. Even without
+        # the custom grouped SiTU op or a shared schedule, use live GMM views.
+        inp.layer.cann_mega_moe_w13_weight_list = []
+        calls.clear()
+        method.apply_gmm1_act_quant(inp)
+        self.assertEqual(calls, ["gmm1", "legacy_situ"])
+        del inp.layer.cann_mega_moe_w13_weight_list
         inp.shared_expert_schedule = NS(after_gmm1=lambda: calls.append("shared_down"))
         calls.clear()
         method.apply_gmm1_act_quant(inp)
         self.assertEqual(calls, ["gmm1", "shared_down", "legacy_situ"])
 
 
-class TestSituDispatchContracts(unittest.TestCase):
-    def test_count_request_guards_and_real_payload_builder(self):
-        profile = NS(supports=lambda capability: True)
-        ns = dict(
-            torch=NS(
-                float16=torch.float16,
-                bfloat16=torch.bfloat16,
-                ops=NS(custom=NS(grouped_situ_mx_quant=object(), npu_situ_and_mul_sparse=object())),
-            ),
-            MoEActivation=Activation,
-            QuantType=Quant,
-            get_current_hardware_profile=lambda: profile,
-            HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
-            dataclass=dataclass,
-        )
-        load("vllm_ascend/ops/fused_moe/moe_comm_method.py", {"_prefer_expert_token_counts_for_situ"}, ns)
-        load(
-            "vllm_ascend/ops/fused_moe/dataclass/token_dispatcher.py",
-            {"MoETokenDispatchInput", "build_token_dispatch_input"},
-            ns,
-        )
-        config = NS(activation=Activation.SITU, activation_situ_beta=4.0, activation_situ_linear_beta=25.0)
-        fused = NS(
-            hidden_states=torch.ones(3, 8, dtype=torch.bfloat16),
-            topk_weights=torch.ones(3, 1),
-            topk_ids=torch.zeros(3, 1, dtype=torch.int32),
-            routing=object(),
-            quant=NS(quant_type=Quant.W4A8MXFP, is_per_channel_weight=False),
-            lora_context=None,
-            dynamic_eplb=False,
-        )
-        prefer_counts = ns["_prefer_expert_token_counts_for_situ"]
-        self.assertTrue(prefer_counts(config, fused))
-        requested = ns["build_token_dispatch_input"](
-            fused_experts_input=fused, prefer_expert_token_counts=prefer_counts(config, fused)
-        )
-        self.assertTrue(requested.prefer_expert_token_counts)
-        self.assertIs(requested.quant, fused.quant)
-        self.assertIs(requested.routing, fused.routing)
-        self.assertFalse(ns["build_token_dispatch_input"](fused_experts_input=fused).prefer_expert_token_counts)
-        for target, name, invalid in (
-            (fused.quant, "is_per_channel_weight", True),
-            (fused, "lora_context", object()),
-            (fused, "dynamic_eplb", True),
-            (config, "activation_situ_beta", -1.0),
-            (config, "activation_situ_linear_beta", None),
-            (config, "activation_situ_linear_beta", 0.0),
-        ):
-            original = getattr(target, name)
-            setattr(target, name, invalid)
-            self.assertFalse(prefer_counts(config, fused), name)
-            setattr(target, name, original)
-        fused.quant.quant_type = Quant.NONE
-        for dtype in (torch.bfloat16, torch.float16, torch.float32):
-            fused.hidden_states = torch.ones(3, 8, dtype=dtype)
-            self.assertEqual(prefer_counts(config, fused), dtype != torch.float32)
-        fused.hidden_states = fused.hidden_states.bfloat16()
-        profile.supports = lambda capability: False
-        self.assertFalse(prefer_counts(config, fused))
-        profile.supports = lambda capability: True
-        ns["torch"].ops.custom = NS()
-        self.assertFalse(prefer_counts(config, fused))
-        fused.quant.quant_type = Quant.W4A8MXFP
-        self.assertFalse(prefer_counts(config, fused))
-
-    def test_mc2_count_request_reaches_dispatch_without_diff_or_concat(self):
-        counts = torch.tensor([2, 0, 1], dtype=torch.int64)
-        ns = dict(
-            torch=torch,
-            torch_npu=NS(
-                npu_moe_distribute_dispatch_v2=Mock(
-                    return_value=(torch.ones(3, 8), None, None, counts, None, None, None)
-                )
-            ),
-            EXPERT_TOKEN_NUMS_TYPE_COUNT=1,
-            EXPERT_TOKEN_NUMS_TYPE_CUMSUM=0,
-            MoETokenDispatchOutput=NS,
-            MoEMC2CombineMetadata=NS,
-        )
-        load("vllm_ascend/ops/fused_moe/token_dispatcher.py", {"_get_expert_token_nums_type"}, ns)
-        load("vllm_ascend/ops/fused_moe/moe_utils.py", {"cumsum_group_list"}, ns)
-        load(
-            "vllm_ascend/ops/fused_moe/token_dispatcher.py",
-            {"get_dispatch_mc2_kwargs", "token_dispatch"},
-            ns,
-            "TokenDispatcherWithMC2",
-        )
-        dispatcher = ns["TokenDispatcherWithMC2"]()
-        dispatcher.global_bs = 0
-        dispatcher.need_shared_expert_args = False
-        dispatcher.need_extra_args = False
-        dispatcher.need_expert_scale = False
-        dispatcher.moe_all_to_all_group_name = "test_hccl"
-        dispatcher.ep_world_size, dispatcher.ep_rank_id = 8, 0
-        dispatcher.mc2_comm_alg = ""
-        inp = NS(
-            hidden_states=torch.ones(3, 8),
-            topk_weights=torch.ones(3, 1),
-            topk_ids=torch.zeros(3, 1, dtype=torch.int32),
-            routing=NS(expert_map=torch.arange(3), global_redundant_expert_num=0, mc2_mask=None),
-            quant=NS(comm_quant_mode=None, dispatch_with_quant=False, use_w4a8_per_channel_gmm_swiglu=False),
-            prefer_expert_token_counts=True,
-        )
-        with (
-            patch.object(torch, "diff", side_effect=AssertionError("unexpected prefix conversion")),
-            patch.object(torch, "cat", side_effect=AssertionError("unexpected count concatenation")),
-        ):
-            result = dispatcher.token_dispatch(inp)
-            self.assertIs(ns["cumsum_group_list"](result.group_list, result.group_list_type, 1), counts)
-        self.assertEqual(ns["torch_npu"].npu_moe_distribute_dispatch_v2.call_args.kwargs["expert_token_nums_type"], 1)
-        self.assertIs(result.group_list, counts)
-        self.assertEqual(result.group_list_type, 1)
-        inp.prefer_expert_token_counts = False
-        self.assertEqual(dispatcher.get_dispatch_mc2_kwargs(inp)["expert_token_nums_type"], 0)
-        inp.quant.use_w4a8_per_channel_gmm_swiglu = True
-        self.assertEqual(dispatcher.get_dispatch_mc2_kwargs(inp)["expert_token_nums_type"], 1)
-
-        class TorchProxy:
-            npu = NS(current_stream=lambda: NS(record_event=lambda: object()))
-            ops = NS(custom=NS(grouped_situ_mx_quant=object()))
-
-            def __getattr__(self, name):
-                return getattr(torch, name)
-
-        ns.update(
-            torch=TorchProxy(),
-            dataclass=dataclass,
-            MoEActivation=Activation,
-            QuantType=Quant,
-            get_current_hardware_profile=lambda: NS(supports=lambda capability: True),
-            HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
-            _EXTRA_CTX=NS(moe_comm_method=object()),
-            build_mlp_compute_input=lambda **kwargs: object(),
-            apply_moe_mlp=lambda *args: (torch.ones(3, 8), object()),
-            FusedExpertsResult=NS,
-        )
-        load(
-            "vllm_ascend/ops/fused_moe/dataclass/token_dispatcher.py",
-            {"MoETokenDispatchInput", "build_token_dispatch_input"},
-            ns,
-        )
-        path = "vllm_ascend/ops/fused_moe/moe_comm_method.py"
-        load(path, {"_prefer_expert_token_counts_for_situ"}, ns)
-        load(path, {"fused_experts"}, ns, "MoECommMethod")
-        comm = ns["MoECommMethod"]()
-        comm.token_dispatcher = dispatcher
-        comm.moe_config = NS(activation=Activation.SITU, activation_situ_beta=4.0, activation_situ_linear_beta=25.0)
-        comm.shared_activation_overlaps_routed_gmm1 = False
-        dispatcher.token_combine = lambda **kwargs: kwargs["hidden_states"]
-        inp.quant.quant_type = Quant.W4A8MXFP
-        inp.quant.is_per_channel_weight = False
-        inp.quant.use_w4a8_per_channel_gmm_swiglu = False
-        inp.lora_context, inp.dynamic_eplb, inp.shared_expert_schedule = None, False, None
-        # The real comm method must request counts, not merely accept an
-        # explicitly constructed dispatch payload that already asked for them.
-        result = comm.fused_experts(inp, object())
-        self.assertEqual(result.group_list_type, 1)
-        self.assertIs(result.expert_tokens, counts)
-        self.assertEqual(ns["torch_npu"].npu_moe_distribute_dispatch_v2.call_args.kwargs["expert_token_nums_type"], 1)
-
-    def test_a5_topk_uses_native_dispatcher_after_alias_override(self):
-        logits = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
-        weights = torch.tensor([[0.2, 0.3]])
-        ids = torch.tensor([[3, 2]], dtype=torch.int64)
-        auxiliary = torch.empty_like(logits)
-        alias = Mock(side_effect=AssertionError("recipes Hash alias must not run"))
-        native = Mock(return_value=(weights, ids, auxiliary))
-        ns = dict(
-            torch=NS(ops=NS(npu=NS(npu_moe_gating_top_k=native)), int32=torch.int32),
-            torch_npu=NS(npu_moe_gating_top_k=alias),
-        )
-        load("vllm_ascend/device/device_op.py", {"moe_gating_top_k"}, ns, "A5DeviceAdaptor")
-        for norm_type in (0, 1):
-            for renorm in (0, 1):
-                with self.subTest(norm_type=norm_type, renorm=renorm):
-                    native.reset_mock()
-                    actual, actual_ids, out = ns["A5DeviceAdaptor"].moe_gating_top_k(
-                        logits,
-                        k=2,
-                        k_group=1,
-                        group_count=1,
-                        group_select_mode=1,
-                        renorm=renorm,
-                        norm_type=norm_type,
-                        out_flag=False,
-                    )
-                    native.assert_called_once()
-                    self.assertEqual(native.call_args.kwargs["renorm"], 0)
-                    self.assertEqual(native.call_args.kwargs["norm_type"], norm_type)
-                    expected = weights / weights.sum(-1, keepdim=True) if norm_type == 0 and renorm == 1 else weights
-                    torch.testing.assert_close(actual, expected)
-                    torch.testing.assert_close(actual_ids, ids.to(torch.int32))
-                    self.assertIs(out, auxiliary)
-                    alias.assert_not_called()
-
-
-class TestRoutedScheduleBoundary(unittest.TestCase):
-    def test_scheduled_mxfp_releases_shared_down_before_native_activation(self):
-        gate_up = torch.randn(3, 8).bfloat16()
-        activated, scale = gate_up[:, :4], torch.ones(3, 1)
-        calls = []
-
-        def mark(name, value):
-            return Mock(side_effect=lambda *args, **kwargs: (calls.append(name), value)[1])
-
-        ns = dict(
-            torch=NS(
-                bfloat16=torch.bfloat16,
-                float8_e4m3fn=torch.float8_e4m3fn,
-                ops=NS(_C_ascend=NS(situ_mx_quant=mark("native_activation", (activated, scale)))),
-            ),
-            torch_npu=NS(float8_e8m0fnu="e8m0", float4_e2m1fn_x2="fp4", npu_grouped_matmul=mark("gmm1", [gate_up])),
-            DeviceOperator=NS(npu_grouped_matmul_situ_quant=mark("native_fused", (activated, scale, None))),
-            MoEActivation=NS(SITU="situ"),
-            get_current_hardware_profile=lambda: NS(supports=lambda cap: False),
-            HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
-            dispose_tensor=lambda x: None,
-            maybe_normalize_mxfp_scale_layout=lambda x: x,
-            SITU_MX_DST_TYPE_E4M3FN=36,
-        )
-        clsname = "AscendW4A8MXFPDynamicFusedMoEMethod"
-        load(
-            "vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py",
-            {"_use_grouped_situ", "apply_gmm1_act_quant"},
-            ns,
-            clsname,
-        )
-        method = ns[clsname]()
-        method.group_size = 32
-        method.use_expert_weight_list = False
-        method.quant_type = "mxfp4"
-        method._quant_hidden_states = lambda x, s: (x, s)
-        method._get_mlp_weights = lambda layer: ([layer.w13_weight], [layer.w13_weight_scale], [], [])
-        inp = NS(
-            hidden_states=torch.zeros(3, 4),
-            dynamic_scale=scale,
-            layer=NS(w13_weight=object(), w13_weight_scale=object()),
-            activation="situ",
-            group_list_type=1,
-            group_list=torch.tensor([0, 2, 1]),
-            activation_situ_beta=4.0,
-            activation_situ_linear_beta=25.0,
-            shared_expert_schedule=None,
-        )
-        result = method.apply_gmm1_act_quant(inp)
-        self.assertIs(result[0], activated)
-        self.assertEqual(calls, ["native_fused"])
-        calls.clear()
-        inp.shared_expert_schedule = NS(after_gmm1=lambda: calls.append("shared_down"))
-        result = method.apply_gmm1_act_quant(inp)
-        self.assertIs(result[0], activated)
-        self.assertEqual(calls, ["gmm1", "shared_down", "native_activation"])
-
-    def test_unfused_mlp_releases_shared_down_before_activation_and_keeps_pair(self):
-        calls = []
-
-        def mark(name, value):
-            return Mock(side_effect=lambda *args, **kwargs: (calls.append(name), value)[1])
-
-        event = object()
-        ns = dict(
-            torch=NS(npu=NS(current_stream=lambda: NS(record_event=mark("record_event", event)))),
-            _unified_apply_activation=mark("activation", "activated"),
-        )
-        load("vllm_ascend/ops/fused_moe/moe_mlp.py", {"apply_moe_mlp"}, ns)
-        method = NS(
-            supports_fused_activation=lambda activation: False,
-            apply_gmm1=mark("gmm1", "gate_up"),
-            apply_act_quant=mark("quant", ("quantized", "scale")),
-            apply_gmm2=mark("gmm2", "result"),
-        )
-        inp = NS(
-            quant=NS(is_quant=False),
-            activation="silu",
-            shared_expert_schedule=NS(after_gmm1=lambda: calls.append("shared_down")),
-        )
-        self.assertEqual(ns["apply_moe_mlp"](inp, method), ("result", event))
-        self.assertEqual(calls, ["gmm1", "shared_down", "activation", "quant", "record_event", "gmm2"])
-
-
 class TestDecodeDependencies(unittest.TestCase):
     def test_bf16_and_mxfp_share_vector_barriers(self):
         for quantized in (False, True):
-            with self.subTest(quantized=quantized):
-                self.check_dependency_graph(quantized)
+            for superkernel in (False, True):
+                with self.subTest(quantized=quantized, superkernel=superkernel):
+                    self.check_dependency_graph(quantized, superkernel)
 
-    def check_dependency_graph(self, quantized):
+    def check_dependency_graph(self, quantized, superkernel):
         nodes = []
         last = {"main": None, "shared": None, "comm": None}
         current = ["main"]
@@ -491,7 +220,7 @@ class TestDecodeDependencies(unittest.TestCase):
             torch_npu=NS(
                 npu=NS(
                     npugraph_ex=NS(
-                        scope=NS(limit_core_num=lambda *limit: limits.append((current[0], limit)) or nullcontext())
+                        scope=NS(limit_core_num=lambda *limit: (limits.append((current[0], limit)) or nullcontext()))
                     )
                 )
             ),
@@ -512,7 +241,7 @@ class TestDecodeDependencies(unittest.TestCase):
             return NS(gate_up=x, hidden_states=x)
 
         def activate(x):
-            op("shared_activation")
+            op("shared_situ")
             return x * 2
 
         def down(x, y):
@@ -536,7 +265,9 @@ class TestDecodeDependencies(unittest.TestCase):
             _pad_and_reduce_scatter=scatter,
         )
         op("ready")
-        schedule = ns["KimiDecodeSchedule"](shared, x, last["main"], comm_stream=streams["comm"])
+        schedule = ns["KimiDecodeSchedule"](
+            shared, x, last["main"], comm_stream=streams["comm"], enable_superkernel=superkernel
+        )
         self.assertFalse(any(name == "gate_up" for _, name, _ in nodes))
         op("before_dispatch")
         schedule.before_dispatch(last["main"])
@@ -546,7 +277,7 @@ class TestDecodeDependencies(unittest.TestCase):
         with patch.object(torch.Tensor, "record_stream") as comm_record:
             schedule.after_gmm1()
         comm_record.assert_called_once_with(streams["comm"])
-        op("routed_activation")
+        op("routed_situ")
         op("gmm2")
         op("combine")
         with patch.object(torch.Tensor, "record_stream") as record_stream:
@@ -562,19 +293,19 @@ class TestDecodeDependencies(unittest.TestCase):
         ids = {name: i for i, (_, name, _) in enumerate(nodes) if name != "wait"}
         for before, after in [
             ("before_dispatch", "gate_up"),
-            ("dispatch", "shared_activation"),
-            ("shared_activation", "gmm1"),
+            ("dispatch", "shared_situ"),
+            ("shared_situ", "gmm1"),
             ("gmm1", "shared_down"),
             ("shared_down", "shared_rs"),
             ("shared_rs", "add"),
         ]:
             self.assertIn(ids[before], ancestors(ids[after]))
-        self.assertNotIn(ids["shared_down"], ancestors(ids["routed_activation"]))
+        self.assertNotIn(ids["shared_down"], ancestors(ids["routed_situ"]))
         self.assertNotIn(ids["gate_up"], ancestors(ids["dispatch"]))
         self.assertNotIn(ids["dispatch"], ancestors(ids["gate_up"]))
         self.assertEqual(nodes[ids["shared_rs"]][0], "comm")
         self.assertNotIn(ids["combine"], ancestors(ids["shared_rs"]))
-        self.assertLess(ids["shared_rs"], ids["routed_activation"])
+        self.assertLess(ids["shared_rs"], ids["routed_situ"])
         shared._prepare_linear_input_for_overlap.assert_not_called()
         if quantized:
             self.assertIn(ids["gmm1"], ancestors(ids["shared_down_quant"]))

@@ -449,6 +449,16 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         layer._mxfp4_transformed = False
 
     def _get_mlp_weights(self, layer):
+        if hasattr(layer, "cann_mega_moe_w13_weight_list"):
+            # MegaMoE owns the live (out, in) lists; its loader released the
+            # dense parameters. Decode/graph fallback still needs GMM views.
+            # Reuse storage, as in the existing expert-list path below.
+            return (
+                [weight.transpose(0, 1) for weight in layer.cann_mega_moe_w13_weight_list],
+                [scale.transpose(0, 1) for scale in layer.cann_mega_moe_w13_weight_scale_list],
+                [weight.transpose(0, 1) for weight in layer.cann_mega_moe_w2_weight_list],
+                [scale.transpose(0, 1) for scale in layer.cann_mega_moe_w2_weight_scale_list],
+            )
         if self.use_expert_weight_list:
             return (
                 [weight.transpose(0, 1) for weight in layer.w13_weight_list],
@@ -488,6 +498,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             # even when the optional grouped SiTU operator is unavailable.
             and not get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
             and mlp_compute_input.shared_expert_schedule is None
+            and not hasattr(layer, "cann_mega_moe_w13_weight_list")
             and mlp_compute_input.activation == MoEActivation.SITU
             and mlp_compute_input.group_list_type in (0, 1)
             and self.group_size == 32

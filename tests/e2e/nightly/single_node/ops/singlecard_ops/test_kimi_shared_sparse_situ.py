@@ -8,15 +8,11 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SituAndMul
 
 from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
-from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 128])
 def test_shared_sparse_situ_accuracy(tokens, record_property):
-    if not torch.npu.is_available():
-        pytest.skip("requires Ascend NPU")
-    initialize_kimi_situ_ops()
-    if not hasattr(torch.ops.custom, "npu_situ_and_mul_sparse"):
+    if not torch.npu.is_available() or not hasattr(torch.ops.custom, "npu_situ_and_mul_sparse"):
         pytest.skip("requires Ascend NPU and sparse SiTU operator")
     torch.manual_seed(7)
     with set_current_vllm_config(VllmConfig()):

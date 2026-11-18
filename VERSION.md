@@ -1,14 +1,18 @@
-# 0.30.0-v1.3 PR12_控核多流_SiTU_v3
+# 0.30.0-v1.4
 
-以官方 f89 为基线，保留 PR12 的 A5 Decode 控核、多流和 SiTU 路径。Router 和 BF16 共享 Gate/Up 使用 32 个 AIC、1 个 AIV，MXFP 共享 Gate/Up 使用 16 个 AIC、32 个 AIV。注意力残差使用官方 `attn_res_fwd`，原生 Decoder 和 LinearModel 残差实现保留。
+本分支对应 `GitHub_PR5_PR12_完整版`。源码来自 `cann-framework/vllm-ascend` 的 `cdab93b6d2fd0f8855494641392893372fe38da9`，其父提交 `0807cef7025695bfdec9267377b4449d470ba1e6` 已包含 PR #5。分支在该合并提交上增加本说明，源码和子模块指针与源仓一致。 [PR #5](https://github.com/cann-framework/vllm-ascend/pull/5) · [PR #12](https://github.com/cann-framework/vllm-ascend/pull/12)
 
-源码基于 `f89e5592d6fbcb36ee8ce0e538d23f0dd8f951b8`，按工作区 `PR12_控核多流_SiTU_v3` 交付补丁重建。SiTU 的实现来源见 [cann-framework/vllm-ascend PR12](https://github.com/cann-framework/vllm-ascend/pull/12)。
+## 功能
 
-## 配置
+- PR #5 为 Kimi K3 的 AttnRes 增加 `fused`、`two_phase`、`original` 和 `native` 四种后端。默认请求 `fused`，必要算子不可用时回退到 `two_phase`。
+- PR #12 增加 Kimi 文本编译和 Decode MoE 多流。符合条件的 A5、MC2、SP、纯 Decode 批次使用分阶段的共享专家计算和通信，并限制 Router Gate 和共享 Gate-Up 的计算核。
+- 图捕获可将符合条件的 Decode MoE 调度范围交给 SuperKernel 优化。符合硬件、量化和批次条件时，V1 纯 Prefill 可用 `enable_fused_mc2=2` 选择 MegaMoE。
 
-按下方配置启用普通 MC2 和共享专家并行。选择符合 A5、Decode、MC2、SP、BF16 和量化条件的 Kimi 批次，用 profiler 核对投影用核和事件顺序。
+## 使用
 
-将下列字段并入现有的 `--additional-config`。
+在与该提交匹配的 vLLM、CANN 和 torch-npu 环境中构建。Git 检出后运行 `git submodule update --init --recursive`，按固定提交获取 Catlass 及其 googletest 子模块。
+
+需要验证 V2 Decode SuperKernel 时，设置 `VLLM_USE_V2_MODEL_RUNNER=1`，并将以下字段合入 `--additional-config`。
 
 ```json
 {
@@ -17,23 +21,14 @@
   "enable_shared_expert_dp": false,
   "ascend_compilation_config": {
     "enable_npugraph_ex": true,
-    "enable_super_kernel": false
+    "enable_static_kernel": true,
+    "enable_super_kernel": true
   }
 }
 ```
 
-在各模型 worker 环境中安装匹配的 recipes `custom_ops` 扩展和 CANN 算子包。图模式还需要配套的图转换器。算子缺失时按原生路径执行。运行后检查注册和实际选用的算子。
+稀疏或分组 SiTU 使用可选 recipes `custom_ops`，需在各 worker 安装匹配扩展。接口约束、回退条件和运行时调度见 [Kimi K3 0.30 移植说明](docs/source/developer_guide/kimi_k3_v030_migration.md)。
 
 ## 验证
 
-已对照原交付清单核验 25 个文件，运行了 33 项隔离 CPU 回归。完整仓库测试、Ascend NPU 精度和性能验证尚未运行。
-
-在源码根目录运行本分支的隔离 CPU 回归。
-
-```bash
-python tests/ut/ops/test_kimi_moe_front_overlap.py
-python tests/ut/ops/test_kimi_v30_moe.py
-python tests/ut/ops/test_kimi_v30_review.py
-python tests/ut/ops/test_kimi_situ_loading.py
-python tests/ut/models/test_kimi_v2_sequence_parallel.py
-```
+归档中主仓的 4,478 个文件已逐一核对 Git blob 和文件模式。分支保留 Catlass 指针 `41bf90da655bba3c66d0acd7e00abe33960ecfd6`。完整构建、NPU 图捕获、多卡通信和性能仍需在目标环境验证。

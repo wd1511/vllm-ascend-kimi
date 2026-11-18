@@ -4,6 +4,7 @@
 import torch
 import torch_npu
 
+from vllm_ascend.compilation.kimi_moe_superkernel import moe_superkernel_scope
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
 ROUTER_CORE_LIMIT = (32, 1)
@@ -19,8 +20,9 @@ class KimiDecodeSchedule:
     routed activation/quantization/GMM2. Other paths keep the 0.30 schedule.
     """
 
-    def __init__(self, shared, prepared_input, router_ready, *, comm_stream=None):
+    def __init__(self, shared, prepared_input, router_ready, *, enable_superkernel=False, comm_stream=None):
         self.shared = shared
+        self.enable_superkernel = enable_superkernel
         self.comm_stream = comm_stream if comm_stream is not None else shared_experts_calculation_stream()
         self.prepared = shared.prepare_for_router_overlap(prepared_input, router_ready)
         assert self.prepared is not None
@@ -68,7 +70,7 @@ class KimiDecodeSchedule:
             self.output.record_stream(self.comm_stream)
         # Dedicated communication stream waits only for its producer, never
         # for routed Combine. The final join consumes this invocation's event.
-        with npu_stream_switch(self.comm_stream):
+        with moe_superkernel_scope(None, self.enable_superkernel), npu_stream_switch(self.comm_stream):
             torch.npu.current_stream().wait_event(down_done)
             self.output = self.shared._pad_and_reduce_scatter(self.output)
             self.output_done = torch.npu.current_stream().record_event()
