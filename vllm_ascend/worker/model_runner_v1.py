@@ -111,6 +111,8 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
+import vllm_ascend.envs as envs_ascend
+
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
@@ -361,6 +363,12 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self._synced_batch_contains_decode = False
+        # Resources for the DP metadata exchange on a dedicated side stream;
+        # allocated lazily by _dp_metadata_allreduce_on_side_stream.
+        self._dp_metadata_stream: torch.npu.Stream | None = None
+        self._dp_metadata_event: torch.npu.Event | None = None
+        self._dp_metadata_pinned: torch.Tensor | None = None
+        self._dp_metadata_device: torch.Tensor | None = None
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -754,14 +762,18 @@ class NPUModelRunner(GPUModelRunner):
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
         mega_moe_enabled = self.ascend_config.enable_fused_mc2 == 1 and is_950()
-        metadata_fields = DP_METADATA_FIELD_COUNT if mega_moe_enabled else 2
-        packed_tensor = torch.zeros(metadata_fields, self.dp_size, device="cpu", dtype=torch.int32)
-        packed_tensor[DP_METADATA_NUM_TOKENS][self.dp_rank] = num_tokens
-        packed_tensor[DP_METADATA_CUDAGRAPH_MODE][self.dp_rank] = cudagraph_mode.value
         if mega_moe_enabled:
+            # MegaMoE needs the release branch's four-field CPU collective.
+            packed_tensor = torch.zeros(DP_METADATA_FIELD_COUNT, self.dp_size, device="cpu", dtype=torch.int32)
+            packed_tensor[DP_METADATA_NUM_TOKENS][self.dp_rank] = num_tokens
+            packed_tensor[DP_METADATA_CUDAGRAPH_MODE][self.dp_rank] = cudagraph_mode.value
             packed_tensor[DP_METADATA_HAS_REAL_WORK][self.dp_rank] = not is_dummy_run
             packed_tensor[DP_METADATA_HAS_DECODE][self.dp_rank] = batch_contains_decode
-        dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+            dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        elif envs_ascend.VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM:
+            packed_tensor = self._dp_metadata_allreduce_on_compute_stream(num_tokens, cudagraph_mode)
+        else:
+            packed_tensor = self._dp_metadata_allreduce_on_side_stream(num_tokens, cudagraph_mode)
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[DP_METADATA_NUM_TOKENS, :]
@@ -786,6 +798,62 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
         return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
+
+    def _dp_metadata_allreduce_on_compute_stream(
+        self, num_tokens: int, cudagraph_mode: CUDAGraphMode
+    ) -> torch.Tensor:
+        """Legacy path: collective on the compute stream plus a blocking D2H.
+
+        The all-reduce queues behind every op already enqueued on the compute
+        stream, so the blocking copy makes the host wait for the whole stream
+        backlog (the previous step's remaining kernels) to drain.
+        """
+        packed_tensor = torch.zeros(2, self.dp_size, device="npu", dtype=torch.int32)
+        packed_tensor[0][self.dp_rank] = num_tokens
+        packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        dist.all_reduce(packed_tensor, group=get_dp_group().device_group)
+        # Move the reduced metadata back to CPU, following PR 10046.
+        return packed_tensor.cpu()
+
+    def _dp_metadata_allreduce_on_side_stream(
+        self, num_tokens: int, cudagraph_mode: CUDAGraphMode
+    ) -> torch.Tensor:
+        """Issue the DP metadata exchange on a dedicated side stream.
+
+        The packed metadata is only a few int32 values per DP rank, and its
+        inputs (num_tokens / cudagraph_mode) come from the scheduler output,
+        so the exchange has no data dependency on the compute stream. Issuing
+        [H2D -> all-reduce -> D2H] on a side stream lets the tiny collective
+        execute as soon as the peer DP rank arrives, instead of queueing
+        behind the compute-stream backlog. Under async scheduling this turns
+        the per-step host wait from "previous step fully drains" into "the
+        24-byte exchange completes". Every rank issues DP-group collectives
+        in the same program order from the same worker thread, so collective
+        matching across ranks is preserved.
+        """
+        if self._dp_metadata_stream is None:
+            self._dp_metadata_stream = torch.npu.Stream()
+            self._dp_metadata_event = torch.npu.Event()
+            self._dp_metadata_pinned = torch.zeros(
+                2, self.dp_size, dtype=torch.int32, pin_memory=self.pin_memory
+            )
+            self._dp_metadata_device = torch.zeros(
+                2, self.dp_size, dtype=torch.int32, device=self.device
+            )
+        pinned = self._dp_metadata_pinned
+        # The previous exchange was synchronized before its caller returned,
+        # so the reused staging buffers are safe to overwrite.
+        pinned.zero_()
+        pinned[0][self.dp_rank] = num_tokens
+        pinned[1][self.dp_rank] = cudagraph_mode.value
+        with torch.npu.stream(self._dp_metadata_stream):
+            self._dp_metadata_device.copy_(pinned, non_blocking=True)
+            dist.all_reduce(self._dp_metadata_device, group=get_dp_group().device_group)
+            pinned.copy_(self._dp_metadata_device, non_blocking=True)
+            self._dp_metadata_event.record()
+        self._dp_metadata_event.synchronize()
+        # Clone so the returned views cannot alias the reused pinned buffer.
+        return pinned.clone()
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -1375,16 +1443,11 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
-        # Sync num_accepted_tokens from CPU (set by
-        # _update_states_after_model_execute for hybrid models).
-        if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
-            self._sync_num_accepted_tokens(num_reqs, has_prev_mapping=bool(prev_req_id_to_index))
-            self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
-        else:
-            self.num_accepted_tokens.np.fill(1)
-            self.num_accepted_tokens.gpu.fill_(1)
+        # NOTE: The num_accepted_tokens event sync/publish intentionally lives
+        # in execute_model right before the mamba block, not here: everything
+        # between this point and the mamba bookkeeping is independent of the
+        # accepted counts, so deferring the wait lets it overlap with the
+        # previous step's remaining execution instead of stalling input prep.
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
@@ -2297,6 +2360,23 @@ class NPUModelRunner(GPUModelRunner):
                     self.update_eplb_heat_collection_status(num_tokens_padded)
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+                # Sync num_accepted_tokens from CPU (set by
+                # _update_states_after_model_execute for hybrid models).
+                # Placed here, immediately before its only CPU consumer
+                # (preprocess_mamba), so the wait overlaps with the previous
+                # step's remaining execution; the independent input-prep work
+                # in _prepare_inputs above already ran while waiting.
+                if self.num_accepted_tokens_event is not None:
+                    self.num_accepted_tokens_event.synchronize()
+                    self._sync_num_accepted_tokens(
+                        num_reqs, has_prev_mapping=bool(self.input_batch.prev_req_id_to_index)
+                    )
+                    self.num_accepted_tokens.np[num_reqs:].fill(1)
+                    self.num_accepted_tokens.copy_to_gpu()
+                else:
+                    self.num_accepted_tokens.np.fill(1)
+                    self.num_accepted_tokens.gpu.fill_(1)
 
                 # postprocess_mamba runs later in _update_states_after_model_execute.
                 if self.cache_config.mamba_cache_mode == "align":
