@@ -35,6 +35,10 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -53,12 +57,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_reduce_scatter,
-    sp_shard,
-)
 from vllm.models.kimi_k3.amd.linear import (
     KimiDecoderLayer as UpstreamKimiDecoderLayer,
 )
@@ -89,8 +87,15 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import register_kimi_moe_quant_type
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_attn_res import (
     AttnResBackend,
@@ -339,6 +344,14 @@ def is_moe_layer_idx(config, layer_idx: int) -> bool:
     )
 
 
+def _get_kimi_router_stream(vllm_config: VllmConfig) -> torch.npu.Stream | None:
+    if not get_ascend_config().multistream_overlap_shared_expert:
+        return None
+    if not hasattr(vllm_config, "_kimi_router_stream"):
+        vllm_config._kimi_router_stream = torch.npu.Stream()
+    return vllm_config._kimi_router_stream
+
+
 class AscendKimiMoE(nn.Module):
     """Kimi K3 MoE assembled from the standard vLLM MoE interfaces."""
 
@@ -475,7 +488,7 @@ class AscendKimiMoE(nn.Module):
         object.__setattr__(
             self.experts,
             "_kimi_router_stream",
-            torch.npu.Stream() if get_ascend_config().multistream_overlap_shared_expert else None,
+            _get_kimi_router_stream(vllm_config),
         )
         if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
             # Share a communication stream across this model's MoE layers;
@@ -830,13 +843,16 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         if self.is_block_write_layer:
             prefix_sum = None
 
-        if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)
-            hidden_states = hidden_states[: positions.shape[0]]
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-        )
+        if self.use_sequence_parallel and getattr(self.self_attn, "overlap_mega_kda_commit", False):
+            hidden_states = self.self_attn.forward_with_all_gather(hidden_states, positions)
+        else:
+            if self.use_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)
+                hidden_states = hidden_states[: positions.shape[0]]
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+            )
         if self.use_sequence_parallel and not self.fuse_o_proj_mm_reduce_scatter:
             hidden_states = sp_reduce_scatter(hidden_states)
 
@@ -1288,6 +1304,63 @@ class AscendKimiLinearForCausalLM(UpstreamKimiLinearForCausalLM, KimiMixtureOfEx
 
     packed_modules_mapping = AscendKimiLinearModel.packed_modules_mapping
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        """Return the Ascend MegaKDA page state dtypes.
+
+        The upstream Kimi class only describes conv/checkpoint (and its
+        CUDA RecoverSSM records). ReplaySSM is an Ascend-only ABI, so its
+        three page records must be included here before KV cache allocation.
+        """
+        hf_config = vllm_config.model_config.hf_config
+        base = MambaStateDtypeCalculator.kda_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        enabled = bool(additional.get("enable_mega_kda_replayssm", False))
+        if not enabled:
+            return base
+        return (*base, torch.float32, torch.float16, torch.float32)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        hf_config = vllm_config.model_config.hf_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        base = MambaStateShapeCalculator.kda_state_shape(
+            tp_size,
+            hf_config.linear_attn_config["num_heads"],
+            hf_config.linear_attn_config["head_dim"],
+            conv_kernel_size=hf_config.linear_attn_config["short_conv_kernel_size"],
+            num_spec=num_spec,
+        )
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        enabled = bool(additional.get("enable_mega_kda_replayssm", False))
+        if not enabled:
+            return base
+        local_heads = hf_config.linear_attn_config["num_heads"] // tp_size
+        record = (local_heads, 1 + num_spec, hf_config.linear_attn_config["head_dim"])
+        return (*base, record, record, record)
+
+    def process_weights_after_loading(self) -> None:
+        # vLLM invokes this model hook after every per-module quant finalizer,
+        # before memory profiling. Conv's callback alone is too early: F/OProj
+        # can still be awaiting processing when that callback runs.
+        parent_hook = getattr(super(), "process_weights_after_loading", None)
+        if parent_hook is not None:
+            parent_hook()
+        if not get_ascend_config().enable_mega_kda_replayssm:
+            return
+        for module in self.model.modules():
+            if isinstance(module, AscendKimiK3DeltaAttentionBase):
+                module._prepare_mega_weights()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         self.model_config = vllm_config.model_config
@@ -1418,6 +1491,9 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
                 prefix=maybe_prefix(prefix, "language_model"),
                 architectures=["KimiLinearForCausalLM"],
             )
+        language_layouts = getattr(self.language_model.model_config, "_ascend_kimi_moe_quant_types", ())
+        for quant_type in language_layouts:
+            register_kimi_moe_quant_type(vllm_config, quant_type)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
@@ -1425,6 +1501,35 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
 
     def get_language_model(self) -> AscendKimiLinearForCausalLM:
         return self.language_model
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        """Delegate to the Ascend text model, not the upstream one.
+
+        ``Platform._align_mamba_and_attn_page_size`` resolves this hook on the
+        configured architecture (this VL class) to size the Mamba page before
+        the KV cache is allocated. The upstream delegator targets
+        ``vllm.models.kimi_k3.nvidia.model.KimiLinearForCausalLM``, which does
+        not know about the Ascend ReplaySSM states; the worker would then build
+        a larger MambaSpec than ``cache_config.mamba_page_size_padded`` and the
+        page-size assertion would fire.
+        """
+        text_config = vllm_config.model_config.hf_config.text_config
+        return AscendKimiLinearForCausalLM.get_mamba_state_dtype_from_config(
+            vllm_config.with_hf_config(text_config)
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        """Delegate to the Ascend text model; see the dtype hook above."""
+        text_config = vllm_config.model_config.hf_config.text_config
+        return AscendKimiLinearForCausalLM.get_mamba_state_shape_from_config(
+            vllm_config.with_hf_config(text_config)
+        )
+
+    def process_weights_after_loading(self) -> None:
+        # The loader invokes only the outer model-level hook for VL models.
+        self.language_model.process_weights_after_loading()
 
     def set_dspark_aux_capture_materialized(self, enabled: bool) -> None:
         self.language_model.set_dspark_aux_capture_materialized(enabled)
