@@ -1,0 +1,120 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is a part of the vllm-ascend project.
+#
+# This file is mainly Adapted from vllm-project/vllm/vllm/envs.py
+# Copyright 2023 The vLLM team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import os
+from collections.abc import Callable
+from typing import Any
+
+# The begin-* and end* here are used by the documentation generator
+# to extract the used env vars.
+
+# begin-env-vars-definition
+
+env_variables: dict[str, Callable[[], Any]] = {
+    # max compile thread number for package building. Usually, it is set to
+    # the number of CPU cores. If not set, the default value is None, which
+    # means all number of CPU cores will be used.
+    "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
+    # The build type of the package. It can be one of the following values:
+    # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
+    "CMAKE_BUILD_TYPE": lambda: os.getenv("CMAKE_BUILD_TYPE"),
+    # Whether to compile custom kernels. If not set, the default value is True.
+    # If set to False, the custom kernels will not be compiled.
+    # This configuration option should only be set to False when running UT
+    # scenarios in an environment without an NPU. Do not set it to False in
+    # other scenarios.
+    "COMPILE_CUSTOM_KERNELS": lambda: bool(int(os.getenv("COMPILE_CUSTOM_KERNELS", "1"))),
+    # The CXX compiler used for compiling the package. If not set, the default
+    # value is None, which means the system default CXX compiler will be used.
+    "CXX_COMPILER": lambda: os.getenv("CXX_COMPILER", None),
+    # The C compiler used for compiling the package. If not set, the default
+    # value is None, which means the system default C compiler will be used.
+    "C_COMPILER": lambda: os.getenv("C_COMPILER", None),
+    # The version of the Ascend chip. It's used for package building.
+    # If not set, we will query chip info through `npu-smi`.
+    # Please make sure that the version is correct.
+    "SOC_VERSION": lambda: os.getenv("SOC_VERSION", None),
+    # If set, vllm-ascend will print verbose logs during compilation
+    "VERBOSE": lambda: bool(int(os.getenv("VERBOSE", "0"))),
+    # The home path for CANN toolkit. If not set, the default value is
+    # /usr/local/Ascend/ascend-toolkit/latest
+    "ASCEND_HOME_PATH": lambda: os.getenv("ASCEND_HOME_PATH", None),
+    # The path for HCCL library, it's used by pyhccl communicator backend. If
+    # not set, the default value is libhccl.so.
+    "HCCL_SO_PATH": lambda: os.getenv("HCCL_SO_PATH", None),
+    # The version of vllm is installed. This value is used for developers who
+    # installed vllm from source locally. In this case, the version of vllm is
+    # usually changed. For example, if the version of vllm is "0.9.0", but when
+    # it's installed from source, the version of vllm is usually set to "0.9.1".
+    # In this case, developers need to set this value to "0.9.0" to make sure
+    # that the correct package is installed.
+    "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
+    # Whether to anbale dynamic EPLB
+    "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
+    # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
+    # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+    "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to run the DP metadata all-reduce on the default compute stream
+    # with a blocking D2H copy (legacy behavior). Default False: the 8 * DP-size byte
+    # exchange (num_tokens + cudagraph_mode across DP ranks) is issued on a
+    # dedicated side stream. The host still waits for that exchange, including
+    # peer/communicator queueing, without depending on the compute-stream backlog.
+    # Set to "1" to restore the legacy
+    # compute-stream path if HCCL cross-stream ordering issues are suspected.
+    # Valid values: "0" (default) or "1". Sensitive: No.
+    "VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM", "0"))
+    ),
+    # Whether to enable the `fused` AttnRes backend for Kimi K3 (CANNBot DSL
+    # kernels when `cannbot_dsl` is installed; pure-Torch `two_phase` as the
+    # fallback). Disabling this env var keeps the previous `two_phase` backend
+    # even when CANNBot DSL operators are available.
+    "VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED", "1"))
+    ),
+    # Whether to enable the experimental Kimi K3 W8A8C8 MLA prolog + FlashMLA
+    # decode path. The default is disabled so quantized MLA keeps the legacy
+    # path. Unquantized no-RoPE MLA uses the BF16 fused path independently.
+    # Requires Ascend 950 (A5), a CANN 9.2 matching cann_ops_transformer
+    # install, and supported quantized MLA weights.
+    # If not set, the default value is False.
+    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASH_MLA", "0"))),
+    # Per-tensor scale of the W8A8C8 FlashMLA merged FP8 latent cache. The
+    # write path stores value / scale clamped to the E4M3 range and every read
+    # path (quantized FlashMLA decode, FIA prefill history) multiplies it
+    # back. Valid range: (0, 448]. The default 1.0 matches the reference
+    # recipe; a calibrated value (max latent magnitude / 448) only helps when
+    # real latents exceed the E4M3 range, because E4M3 is a float format
+    # whose relative precision is scale-independent. Not sensitive.
+    "VLLM_ASCEND_FLASH_MLA_KV_SCALE": lambda: float(os.getenv("VLLM_ASCEND_FLASH_MLA_KV_SCALE", "1.0")),
+}
+
+# end-env-vars-definition
+
+
+def __getattr__(name: str):
+    # lazy evaluation of environment variables
+    if name in env_variables:
+        return env_variables[name]()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return list(env_variables.keys())
