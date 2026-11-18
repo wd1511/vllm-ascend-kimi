@@ -47,6 +47,27 @@ static constexpr uint64_t L1_K_N_THRESHOLD = 128;
 static constexpr uint64_t L1_K_M_THRESHOLD = 256; // 生产 swiglu_v2 动态规则
 static constexpr uint64_t A_L1_BUFFER_ELEMS = 128 * GetKBUnit<fp8_e4m3fn_t>();
 static constexpr uint32_t TENSOR_LIST_FLAG = 1U << 1;
+// sv3_cont（M 条件化双角色拆分）：双角色拆分（供数专核 + epilogue 专核）的收益随
+// 每 L1 块 M 行数（mL1Size）增大——epilogue 工作量 ∝ mL1×nL1，拆分把输出 drain 从
+// 供数路径解耦；代价是供数带宽单核化（两核各半片 → 单核串搬两半片），与 M 无关。
+// 故 mL1Size 小时回退原始交错路径（两核各供半片 + 各做半量 epilogue），mL1Size 达
+// 阈值才启用双角色拆分。阈值 34 按 M 分布间隙条件化：round_4 nk_split 实测 maxL1M=32
+// 的 launch 在 DUAL 下退化（case1 S_i 1.1701→1.1028，拆分调度/握手开销>供给收益假设），
+// maxL1M=36/43/58 均获益（case6/7/8）；maxL1M 观测间隙 [33,35] 取中点 34（对两侧观测
+// 边界各 ±2 余量；baseM=128 下 maxL1M=组表最大 expert M，由 tiling/组表推导，非 case 特化）。
+// round_2 原始依据（28-29 行 S=0.989 vs 35-36 行 S=1.066）与本间隙相容。
+// 模式在整个 launch 内全局恒定（三核同值）：两种模式的核间旗标收支不同构，逐块/
+// 逐组切换会让回退路径的 L1-free 等待消费 sv3 模式积压的陈旧旗标，引发读写竞争。
+static constexpr uint64_t GMSQ_DUAL_ROLE_M_THRESHOLD = 34;
+// nk_tile×sv3_cont 合并新增：双角色整 tile relay 包络。双角色模式下 AIC 把整块
+// [mL1×nL1] F32 经 fixpipe 单投 epilogue 专核（sub 1）的 relay 窗——Variant-A 让出的
+// [64,128KB) 共 64KB（split-M 版每核只收半量行，同窗自然够用）→ 整 tile 需
+// mL1×nL1 ≤ 64KB/4B = 16384 elem。sv3_cont 原基座（r2p2）窄 tile nL1=128、mL1≤128
+// 恰好满槽不越界；nk_tile 宽 tile（mainBlockSize=128 → nL1=256）下 mL1∈[65,128]
+//（baseM=128）会写穿 relay 窗 → 谓词同时要求 MaxGroupL1M×maxNL1Size ≤ 16384，
+// 越界包络的 launch 整体回退交错路径（r3p2 nk_tile 基座实测覆盖的路径）。判据全部
+// 由 tiling 头（mainBlockSize）与组表（MaxGroupL1M）推导，非 case 特化。
+static constexpr uint64_t GMSQ_DUAL_ROLE_RELAY_TILE_ELEMS = 16384;
 
 template <typename T>
 __aicore__ inline __gm__ T *GetTensorAddr(uint16_t index, GM_ADDR tensorPtr)
@@ -162,6 +183,57 @@ private:
 
         basicBlock_.Init(WeightQuantBatchMatmulV2::Arch35::MX_GROUPSIZE, yGm_, yScaleGm_, hdr_->beta, hdr_->invBeta,
                          hdr_->linearBeta, hdr_->invLinearBeta);
+        // sv3_cont：模式判据在三核（AIC / AIV sub0 / AIV sub1）上由同一 tiling 头与同一
+        // 组表内容独立推导，结果必然一致，无需额外同步；整个 launch 全程恒定。
+        // nk_tile 合并：追加整 tile relay 64KB 包络上界（宽 tile 下 mL1>64 的 launch
+        // 整体回退交错路径，见 GMSQ_DUAL_ROLE_RELAY_TILE_ELEMS 注释）。
+        uint64_t maxL1M = MaxGroupL1M();
+        bool dualRoleMode =
+            maxL1M >= GMSQ_DUAL_ROLE_M_THRESHOLD && maxL1M * (hdr_->mainBlockSize * 2ULL) <= GMSQ_DUAL_ROLE_RELAY_TILE_ELEMS;
+        basicBlock_.SetDualRoleMode(dualRoleMode);
+    }
+
+    // sv3_cont：组表扫描求 max(每 L1 块 M 行数)。与 ProcessGroup 的 mBlkNum/mL1Size
+    // 公式逐字一致（CeilDivide(mSize, CeilDivide(mSize, baseM))）；零 token 组与
+    // Process 的 skip 规则一致。host 表 / device group_list 两种入口都只读 GM 数据，
+    // 各核结果相同。
+    __aicore__ inline uint64_t MaxGroupL1M()
+    {
+        const uint64_t baseM = hdr_->baseM;
+        uint64_t maxML1 = 0;
+        if (hostTableMode_) {
+            for (uint32_t g = 0; g < hdr_->activeCount; ++g) {
+                const uint64_t mSize = entries_[g].mSize;
+                if (mSize == 0) {
+                    continue;
+                }
+                const uint64_t mBlkNum = WQ::CeilDivide(mSize, baseM);
+                const uint64_t mL1 = WQ::CeilDivide(mSize, mBlkNum);
+                if (mL1 > maxML1) {
+                    maxML1 = mL1;
+                }
+            }
+        } else {
+            for (uint32_t g = 0; g < eCount_; ++g) {
+                const int64_t v = glGm_[g];
+                uint64_t cnt;
+                if (glType_ == 1) {
+                    cnt = static_cast<uint64_t>(v);
+                } else {
+                    const int64_t start = (g == 0) ? 0 : glGm_[g - 1];
+                    cnt = static_cast<uint64_t>(v - start);
+                }
+                if (cnt == 0) {
+                    continue;
+                }
+                const uint64_t mBlkNum = WQ::CeilDivide(cnt, baseM);
+                const uint64_t mL1 = WQ::CeilDivide(cnt, mBlkNum);
+                if (mL1 > maxML1) {
+                    maxML1 = mL1;
+                }
+            }
+        }
+        return maxML1;
     }
 
     __aicore__ inline void ProcessGroup(const SituGroupEntry &ent, uint32_t groupIdx, uint32_t cubeBlockIdx,
@@ -221,6 +293,33 @@ private:
             cur.nL1Size = halfNRemaining >= basicBlockSize ? basicBlockSize * 2 : halfNRemaining * 2;
             cur.yGmAddr = reinterpret_cast<GM_ADDR>(curYBase_);
             cur.yScaleGmAddr = reinterpret_cast<GM_ADDR>(curYScaleBase_);
+
+            // nk_tile 宽 N 块容量守卫（通用 shape 规则，非 case 特化）：
+            // SiTU epilogue 刮擦平面按生产上界 mReal×nHalf ≤ 64×64 定容
+            //（GetGmmsqSituBufferInfo：gate/up/out/yFp8 均 64×64 elem）。
+            // 宽块（nL1Size>128）在 mL1Size>64 时会越界 → 拆为连续 128 宽子块
+            //（逐语句等价于基线块序列：kbL1 规则/kaL1 定容/prev 链全部按子块重算）。
+            if (cur.nL1Size > 2 * L1_K_N_THRESHOLD && cur.mL1Size > 64) {
+                const uint64_t subHalfW = L1_K_N_THRESHOLD / 2; // 每子块 64 个 gate 列
+                for (uint64_t subOff = 0; subOff < cur.nL1Size / 2; subOff += subHalfW) {
+                    BasicBlockOffsetParam sub = cur;
+                    sub.nOffset = cur.nOffset + subOff;
+                    uint64_t subHalfRemaining = cur.nSize / 2 - sub.nOffset;
+                    sub.nL1Size = subHalfRemaining >= subHalfW ? subHalfW * 2 : subHalfRemaining * 2;
+                    sub.kbL1Size = (sub.mL1Size <= L1_K_M_THRESHOLD && sub.nL1Size <= L1_K_N_THRESHOLD) ? L1_K_512
+                                                                                                        : L1_K_256;
+                    uint64_t subMl1Align = WQ::CeilAlign(sub.mL1Size, static_cast<uint64_t>(BLOCK_CUBE));
+                    uint64_t subKaDepth = WQ::CeilDivide(sub.nL1Size, subMl1Align * 2);
+                    uint64_t subMaxKaDepth = A_L1_BUFFER_ELEMS / (subMl1Align * sub.kbL1Size);
+                    if (subKaDepth > subMaxKaDepth) {
+                        subKaDepth = subMaxKaDepth;
+                    }
+                    sub.kaL1Size = subKaDepth * sub.kbL1Size;
+                    basicBlock_.ComputeBasicBlock(sub, prev);
+                    prev = sub;
+                }
+                continue;
+            }
 
             // 生产动态 k 切分规则：小 M 窄 N 走 512 深度 L1 k
             cur.kbL1Size = (cur.mL1Size <= L1_K_M_THRESHOLD && cur.nL1Size <= L1_K_N_THRESHOLD) ? L1_K_512 : L1_K_256;

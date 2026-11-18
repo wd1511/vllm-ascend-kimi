@@ -27,6 +27,14 @@ from typing import Any
 
 # begin-env-vars-definition
 
+
+def _strict_binary_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be either '0' or '1', got {value!r}")
+    return value == "1"
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -71,39 +79,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to run the DP metadata all-reduce on the default compute stream
-    # with a blocking D2H copy (legacy behavior). Default False: the 8 * DP-size byte
-    # exchange (num_tokens + cudagraph_mode across DP ranks) is issued on a
-    # dedicated side stream. The host still waits for that exchange, including
-    # peer/communicator queueing, without depending on the compute-stream backlog.
-    # Set to "1" to restore the legacy
-    # compute-stream path if HCCL cross-stream ordering issues are suspected.
-    # Valid values: "0" (default) or "1". Sensitive: No.
-    "VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM", "0"))
-    ),
-    # Whether to enable the `fused` AttnRes backend for Kimi K3 (CANNBot DSL
-    # kernels when `cannbot_dsl` is installed; pure-Torch `two_phase` as the
-    # fallback). Disabling this env var keeps the previous `two_phase` backend
-    # even when CANNBot DSL operators are available.
-    "VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED", "1"))
-    ),
-    # Whether to enable the experimental Kimi K3 W8A8C8 MLA prolog + FlashMLA
-    # decode path. The default is disabled so quantized MLA keeps the legacy
-    # path. Unquantized no-RoPE MLA uses the BF16 fused path independently.
-    # Requires Ascend 950 (A5), a CANN 9.2 matching cann_ops_transformer
-    # install, and supported quantized MLA weights.
-    # If not set, the default value is False.
-    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASH_MLA", "0"))),
-    # Per-tensor scale of the W8A8C8 FlashMLA merged FP8 latent cache. The
-    # write path stores value / scale clamped to the E4M3 range and every read
-    # path (quantized FlashMLA decode, FIA prefill history) multiplies it
-    # back. Valid range: (0, 448]. The default 1.0 matches the reference
-    # recipe; a calibrated value (max latent magnitude / 448) only helps when
-    # real latents exceed the E4M3 range, because E4M3 is a float format
-    # whose relative precision is scale-independent. Not sensitive.
-    "VLLM_ASCEND_FLASH_MLA_KV_SCALE": lambda: float(os.getenv("VLLM_ASCEND_FLASH_MLA_KV_SCALE", "1.0")),
+    # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
+    # Valid values: 0 or 1. This configuration is not sensitive.
+    "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
+    # 0 (default): auto-detect from device properties, falling back to 192 KB
+    # (safe for Ascend 910B/A3). Set to a positive value to override when
+    # auto-detection is unavailable or for debugging UB overflow issues.
+    "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
 }
 
 # end-env-vars-definition

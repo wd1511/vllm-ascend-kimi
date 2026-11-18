@@ -26,6 +26,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_ascend.compilation.acl_graph as acl_graph
+from vllm_ascend.ascend_config import FinegrainedTPConfig
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
@@ -33,6 +35,17 @@ BLOCK_SIZE = 128
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 FAKE_WEIGHT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "ut", "_fake_weight")
+
+
+def _make_kv_cache_tensor(size: int, layer_names: list[str], page_size: int) -> KVCacheTensor:
+    """Build a KVCacheTensor; vLLM #51718 renamed shared_by -> layers on main."""
+    return KVCacheTensor(
+        size=size,
+        layers=layer_names,
+        layer_stride=page_size,
+        block_stride=page_size,
+        offset=0,
+    )
 
 
 def initialize_kv_cache(runner: NPUModelRunner):
@@ -49,7 +62,11 @@ def initialize_kv_cache(runner: NPUModelRunner):
     kv_cache_config = KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=[
-            KVCacheTensor(size=tensor_size, shared_by=["layer.0"]),
+            _make_kv_cache_tensor(
+                size=tensor_size,
+                layer_names=["layer.0"],
+                page_size=attn_spec.page_size_bytes,
+            ),
         ],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=attn_spec)],
     )
@@ -395,17 +412,22 @@ def test_determine_batch_execution_and_padding(
 
 
 @pytest.mark.parametrize(
-    ("num_spec_tokens", "computed", "prompts", "scheduled", "expected_mode"),
+    ("num_spec_tokens", "computed", "prompts", "scheduled", "expected_mode", "expected_hybrid_mode"),
     [
-        pytest.param(0, [7], [8], [1], CUDAGraphMode.FULL, id="stateful_one_token_handoff"),
-        pytest.param(0, [0], [1], [1], CUDAGraphMode.NONE, id="first_token_without_state"),
-        pytest.param(7, [16, 24], [8, 8], [8, 8], CUDAGraphMode.FULL, id="steady_spec_decode"),
-        pytest.param(7, [16, 7], [8, 8], [8, 8], CUDAGraphMode.FULL, id="handoff_padded_to_spec_width"),
-        pytest.param(7, [16, 0], [8, 8], [8, 8], CUDAGraphMode.NONE, id="spec_width_prefill_without_state"),
-        pytest.param(7, [16, 7], [8, 8], [8, 1], CUDAGraphMode.NONE, id="nonuniform_handoff"),
+        pytest.param(0, [7], [8], [1], CUDAGraphMode.FULL, CUDAGraphMode.NONE, id="stateful_one_token_handoff"),
+        pytest.param(0, [0], [1], [1], CUDAGraphMode.NONE, CUDAGraphMode.NONE, id="first_token_without_state"),
+        pytest.param(7, [16, 24], [8, 8], [8, 8], CUDAGraphMode.FULL, CUDAGraphMode.FULL, id="steady_spec_decode"),
+        pytest.param(
+            7, [16, 7], [8, 8], [8, 8], CUDAGraphMode.FULL, CUDAGraphMode.NONE, id="handoff_padded_to_spec_width"
+        ),
+        pytest.param(
+            7, [16, 0], [8, 8], [8, 8], CUDAGraphMode.NONE, CUDAGraphMode.NONE, id="spec_width_prefill_without_state"
+        ),
+        pytest.param(7, [16, 7], [8, 8], [8, 1], CUDAGraphMode.NONE, CUDAGraphMode.NONE, id="nonuniform_handoff"),
     ],
 )
 @pytest.mark.parametrize("dp_size", [1, 4])
+@pytest.mark.parametrize("is_hybrid", [False, True])
 def test_stateful_handoff_preserves_decode_graph(
     monkeypatch,
     num_spec_tokens,
@@ -413,9 +435,14 @@ def test_stateful_handoff_preserves_decode_graph(
     prompts,
     scheduled,
     expected_mode,
+    expected_hybrid_mode,
     dp_size,
+    is_hybrid,
 ):
     # Exercise the real dispatcher and DP synchronization using CPU metadata only.
+    if is_hybrid:
+        # Hybrid prompt chunks retain prefill semantics until the prompt is computed.
+        expected_mode = expected_hybrid_mode
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.dcp_size = 1
     runner.dp_size = dp_size
@@ -433,6 +460,12 @@ def test_stateful_handoff_preserves_decode_graph(
         max_cudagraph_capture_size=32,
         compile_sizes=[],
     )
+    runner.model_config = SimpleNamespace(
+        is_encoder_decoder=False,
+        enable_return_routed_experts=False,
+        is_hybrid=is_hybrid,
+        hf_text_config=SimpleNamespace(to_dict=lambda: {}),
+    )
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config,
         compilation_config=runner.compilation_config,
@@ -440,8 +473,9 @@ def test_stateful_handoff_preserves_decode_graph(
         observability_config=SimpleNamespace(cudagraph_metrics=False),
         num_speculative_tokens=num_spec_tokens,
         lora_config=None,
+        model_config=runner.model_config,
     )
-    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=num_spec_tokens) if num_spec_tokens > 0 else None
     runner.uniform_decode_query_len = 1 + num_spec_tokens
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=np.array(computed),
@@ -449,6 +483,7 @@ def test_stateful_handoff_preserves_decode_graph(
         lora_id_to_lora_request={},
     )
     runner.cudagraph_dispatcher = CudagraphDispatcher(runner.vllm_config)
+    runner.ascend_config = SimpleNamespace(finegrained_tp_config=FinegrainedTPConfig())
     runner.cudagraph_dispatcher.initialize_cudagraph_keys(
         CUDAGraphMode.FULL_DECODE_ONLY, runner.uniform_decode_query_len
     )
@@ -460,6 +495,10 @@ def test_stateful_handoff_preserves_decode_graph(
 
     module = "vllm_ascend.worker.model_runner_v1"
     monkeypatch.setattr(f"{module}.should_skip_allreduce_across_dp_group", lambda *args: False)
+    # Keep the test focused on graph dispatch: MC2 requires uniform DP inputs
+    # even when an incomplete handoff forces the batch back to eager mode.
+    monkeypatch.setattr(f"{module}.select_moe_comm_method", lambda *args: MoECommType.MC2)
+    monkeypatch.setattr(f"{module}.use_cann_megamoe", lambda *args: False)
     monkeypatch.setattr(f"{module}.get_dp_group", lambda: SimpleNamespace(cpu_group=None))
     monkeypatch.setattr(f"{module}.dist.all_reduce", all_reduce)
     mode, descriptor, _, tokens_across_dp, _ = runner._determine_batch_execution_and_padding(

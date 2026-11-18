@@ -46,6 +46,7 @@ TITLES = {
         "en": "Dynamic Chunked Pipeline Parallel",
         "zh": "动态分块流水线并行",
     },
+    "developer_guide/Design_Documents/kvpp.md": {"en": "KVPP Design", "zh": "KVPP 设计方案"},
     "developer_guide/Design_Documents/model_runner_v1_eplb.md": {
         "en": "Model Runner V1 EPLB Architecture",
         "zh": "Model Runner V1 EPLB 架构",
@@ -85,10 +86,6 @@ TITLES = {
     "index.md": {"en": "Home", "zh": "首页"},
     "getting_started/installation.md": {"en": "Installation", "zh": "安装指南"},
     "getting_started/quick_start.md": {"en": "Quick Start", "zh": "快速开始"},
-    "tutorials/features/dynamic_chunked_pipeline_parallel.md": {
-        "en": "Dynamic Chunked Pipeline Parallel",
-        "zh": "动态分块流水线并行",
-    },
     "tutorials/features/pd_colocated_mooncake_multi_instance.md": {
         "en": "PD Colocated (Mooncake, Multi-Instance)",
         "zh": "PD 共置（Mooncake，多实例）",
@@ -111,12 +108,17 @@ TITLES = {
     "tutorials/models/DeepSeek-V3.1.md": {"en": "DeepSeek-V3 & 3.1", "zh": "DeepSeek-V3 & 3.1"},
     "tutorials/models/DeepSeek-V3.2.md": {"en": "DeepSeek-V3.2", "zh": "DeepSeek-V3.2"},
     "tutorials/models/DeepSeek-V4-Flash.md": {"en": "DeepSeek-V4-Flash", "zh": "DeepSeek-V4-Flash"},
+    "tutorials/models/DeepSeek-V4.1-Flash.md": {
+        "en": "DeepSeek-V4.1-Flash",
+        "zh": "DeepSeek-V4.1-Flash",
+    },
     "tutorials/models/DeepSeek-V4-Pro.md": {"en": "DeepSeek-V4-Pro", "zh": "DeepSeek-V4-Pro"},
     "tutorials/models/DeepSeekOCR2.md": {"en": "DeepSeek-OCR-2", "zh": "DeepSeek-OCR-2"},
     "tutorials/models/Dots3-Note.md": {"en": "Dots3 Note", "zh": "Dots3 Note"},
+    "tutorials/models/Gemma4.md": {"en": "Gemma4", "zh": "Gemma4"},
     "tutorials/models/GLM4.x.md": {"en": "GLM-4.x(4.5/4.6/4.7)", "zh": "GLM-4.x(4.5/4.6/4.7)"},
-    "tutorials/models/GLM5.2.md": {"en": "GLM-5.2", "zh": "GLM-5.2"},
-    "tutorials/models/GLM5.3.md": {"en": "GLM-5.3 (Experimental)", "zh": "GLM-5.3 (Experimental)"},
+    "tutorials/models/GLM5.2.md": {"en": "GLM-5.2 & GLM-5.3", "zh": "GLM-5.2 & GLM-5.3"},
+    "tutorials/models/GLM5.3-Flash.md": {"en": "GLM-5.3-Flash", "zh": "GLM-5.3-Flash"},
     "tutorials/models/GLM5.md": {"en": "GLM-5 & GLM-5.1", "zh": "GLM-5 & GLM-5.1"},
     "tutorials/models/Hunyuan-A13B-Instruct.md": {"en": "Hunyuan-A13B-Instruct", "zh": "Hunyuan-A13B-Instruct"},
     "tutorials/models/Hy3-preview.md": {"en": "Hy3-preview", "zh": "Hy3-preview"},
@@ -125,7 +127,7 @@ TITLES = {
     "tutorials/models/Kimi-K2-Thinking.md": {"en": "Kimi-K2-Thinking", "zh": "Kimi-K2-Thinking"},
     "tutorials/models/Kimi-K2.5.md": {"en": "Kimi-K2.5", "zh": "Kimi-K2.5"},
     "tutorials/models/Kimi-K2.6.md": {"en": "Kimi-K2.6", "zh": "Kimi-K2.6"},
-    "tutorials/models/Kimi-K3.md": {"en": "Kimi-K3 (Experimental)", "zh": "Kimi-K3（实验性支持）"},
+    "tutorials/models/Kimi-K3.md": {"en": "Kimi-K3", "zh": "Kimi-K3"},
     "tutorials/models/LLaVA-OneVision-Qwen2-0.5B-OV.md": {
         "en": "LLaVA-OneVision-Qwen2-0.5B-OV",
         "zh": "LLaVA-OneVision-Qwen2-0.5B-OV",
@@ -149,6 +151,10 @@ TITLES = {
         "zh": "Qwen3-Dense(0.6B/1.7B/4B/8B/14B/32B)",
     },
     "tutorials/models/Qwen3-Next.md": {"en": "Qwen3-Next", "zh": "Qwen3-Next"},
+    "tutorials/models/Qwen3.8-Flash-Next.md": {
+        "en": "Qwen3.8-Flash-Next (Experimental)",
+        "zh": "Qwen3.8-Flash-Next（实验性支持）",
+    },
     "tutorials/models/Qwen3-Omni-30B-A3B-Thinking.md": {
         "en": "Qwen3-Omni-30B-A3B-Thinking",
         "zh": "Qwen3-Omni-30B-A3B-Thinking",
@@ -163,6 +169,7 @@ TITLES = {
     },
     "tutorials/models/Qwen3-VL-Embedding.md": {"en": "Qwen3-VL-Embedding", "zh": "Qwen3-VL-Embedding"},
     "tutorials/models/Qwen3-VL-Reranker.md": {"en": "Qwen3-VL-Reranker", "zh": "Qwen3-VL-Reranker"},
+    "tutorials/models/SigLIP2.md": {"en": "SigLIP2", "zh": "SigLIP2"},
     "tutorials/models/Qwen3.5-27B-Qwen3.6-27B.md": {
         "en": "Qwen3.5-27B & Qwen3.6-27B",
         "zh": "Qwen3.5-27B & Qwen3.6-27B",
@@ -201,7 +208,15 @@ TITLES = {
     "user_guide/feature_guide/flash_attention.md": {"en": "Flash Attention", "zh": "Flash 注意力"},
     "user_guide/feature_guide/graph_mode.md": {"en": "Graph Mode", "zh": "图模式"},
     "user_guide/feature_guide/kv_cache_cpu_offload.md": {"en": "KV Cache CPU Offload", "zh": "KV Cache CPU 卸载"},
-    "user_guide/feature_guide/kv_pool.md": {"en": "KV Pool", "zh": "KV 池"},
+    "user_guide/feature_guide/kv_cache_pool_ascend_store.md": {
+        "en": "KV Cache Pool (Ascend Store)",
+        "zh": "KV 缓存池（昇腾存储）",
+    },
+    "user_guide/feature_guide/mooncake_layerwise_adaptation_and_optimization.md": {
+        "en": "Mooncake Layerwise Adaptation and Optimization",
+        "zh": "Mooncake Layerwise 适配与优化",
+    },
+    "user_guide/feature_guide/kvpp.md": {"en": "KVPP", "zh": "KVPP"},
     "user_guide/feature_guide/large_scale_ep.md": {"en": "Large Scale EP", "zh": "大规模 EP"},
     "user_guide/feature_guide/lmcache_ascend_deployment.md": {
         "en": "LMCache Ascend Deployment",

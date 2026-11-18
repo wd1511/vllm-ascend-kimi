@@ -89,15 +89,29 @@ jobs:
       matrix:
         group: ${{ fromJSON(inputs.test_groups) }}
     runs-on: ${{ matrix.group.runner }}
+    env:
+      RUNS_ON_S3_BUCKET_CACHE: ascend-ci-cache-hk
+      RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.ap-southeast-1.myhuaweicloud.com
+      RUNS_ON_S3_FORCE_PATH_STYLE: "false"
+      AWS_S3_FORCE_PATH_STYLE: "false"
+      AWS_REGION: ap-southeast-1
+      RUNS_ON_RUNNER_NAME: ""
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:${{ matrix.group.image_tag }}
+      image: quay.io/ascend/cann:${{ matrix.group.image_tag }}
       env:
         VLLM_LOGGING_LEVEL: ERROR
         VLLM_USE_MODELSCOPE: True
         HF_HUB_OFFLINE: 1
         MAX_JOBS: 4
-        UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-        UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu/"
+        UV_FIND_LINKS: "http://cache-service.nginx-pypi-cache.svc.cluster.local/ascend/repos/pypi/triton-ascend"
+        UV_INDEX_URL: >-
+          ${{ matrix.group.npu_type == '310p' &&
+          'https://repo.huaweicloud.com/ascend/repos/pypi/' ||
+          'http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple' }}
+        UV_EXTRA_INDEX_URL: >-
+          ${{ matrix.group.npu_type == '310p' &&
+          'https://repo.huaweicloud.com/repository/pypi/simple' ||
+          'https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu/' }}
         UV_INDEX_STRATEGY: unsafe-best-match
         UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
         UV_HTTP_TIMEOUT: 120
@@ -112,8 +126,13 @@ jobs:
       - name: Install packages
         run: |
           sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
-          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          if [ "${{ matrix.group.npu_type }}" = "310p" ]; then
+            pip config set global.index-url https://repo.huaweicloud.com/ascend/repos/pypi/
+            pip config set global.extra-index-url https://repo.huaweicloud.com/repository/pypi/simple
+          else
+            pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+            pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          fi
           apt-get update -y
           apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev curl gnupg2 zstd
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -205,6 +224,17 @@ jobs:
           # Restore fail-on-cache-miss to true after the transition period.
           fail-on-cache-miss: false
 
+      - name: Restore incremental cache
+        id: fallback-l1
+        if: ${{ matrix.group.npu_type != 'cpu' && steps.cache-csrc.outputs.cache-hit != 'true' }}
+        uses: $/.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          architecture: ${{ steps.get_arch.outputs.arch }}
+          soc-version: ${{ matrix.group.npu_type }}
+          source-root: .
+          csrc-hash: ${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
+
       - name: Install Mooncake wheel
         if: ${{ matrix.group.npu_type != 'cpu' }}
         run: |
@@ -231,7 +261,7 @@ jobs:
           export MAX_JOBS=$(( ${{ matrix.group.num_npus }} * 23 ))
           pip install uc-manager
           uv pip install -r requirements-dev.txt
-          uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+          uv pip install --force-reinstall --no-deps triton-ascend==3.6.0.post2
           # Preserve CI availability during the transition by compiling on the
           # NPU only when the new CPU-produced cache is unavailable.
           if [ "$CSRC_CACHE_HIT" = "true" ]; then
@@ -242,20 +272,70 @@ jobs:
             uv pip install -e . --no-build-isolation
           fi
 
-      - name: Verify required AscendC custom ops are registered (310p)
-        if: ${{ matrix.group.npu_type == '310p' }}
+      - name: Install FLA NPU for selected tests
+        if: ${{ matrix.group.npu_type == 'a2' || matrix.group.npu_type == 'a3' || matrix.group.npu_type == 'a5' }}
+        env:
+          NPU_TYPE: ${{ matrix.group.npu_type }}
+          GIT_PROXY: https://gh-proxy.test.osinfra.cn/
+        run: |
+          set -euo pipefail
+          FLA_VERSION=26.9.1
+          FLA_RELEASE_TAG=v26.9.1-release
+          case "$NPU_TYPE:$(uname -m)" in
+            a2:aarch64)
+              FLA_WHL="flash_linear_attention_npu_a2-${FLA_VERSION}-py3-none-manylinux_2_34_aarch64.whl"
+              FLA_SHA256=aefe29fe3f021db45276b289b1f9882f85a34ce1f9900ba94251bda490af4b6e
+              ;;
+            a2:x86_64)
+              FLA_WHL="flash_linear_attention_npu_a2-${FLA_VERSION}-py3-none-manylinux_2_34_x86_64.whl"
+              FLA_SHA256=411927b9544c60f5f396d5e4e1450766f253e30fc3e2f54f2e29fbe2033fcb13
+              ;;
+            a3:aarch64)
+              FLA_WHL="flash_linear_attention_npu_a3-${FLA_VERSION}-py3-none-manylinux_2_34_aarch64.whl"
+              FLA_SHA256=0e0febfe0b524df54c02dead985b787cf51f276ef904e4c2f88c5d43707a370b
+              ;;
+            a3:x86_64)
+              FLA_WHL="flash_linear_attention_npu_a3-${FLA_VERSION}-py3-none-manylinux_2_34_x86_64.whl"
+              FLA_SHA256=18b8c9d54eadbefb264fd5989577e3bbdb6f2e5cfc8d60d86a0887f2d8a2f26a
+              ;;
+            a5:aarch64)
+              FLA_WHL="flash_linear_attention_npu_a5-${FLA_VERSION}-py3-none-manylinux_2_34_aarch64.whl"
+              FLA_SHA256=c660b90cee1d93c83292bb9b8509371da83493a633efd3e5113f70380d373521
+              ;;
+            a5:x86_64)
+              FLA_WHL="flash_linear_attention_npu_a5-${FLA_VERSION}-py3-none-manylinux_2_34_x86_64.whl"
+              FLA_SHA256=f8be7c724050b6b197ad1b90105ab90e01907d3aa9106abd43ee1026782f2aa5
+              ;;
+            *)
+              echo "::error::Unsupported FLA NPU target: $NPU_TYPE:$(uname -m)"
+              exit 1
+              ;;
+          esac
+          FLA_DOWNLOAD_URL="https://github.com/flashserve/flash-linear-attention-npu/releases/download/${FLA_RELEASE_TAG}/${FLA_WHL}"
+          if [ -n "${GIT_PROXY:-}" ]; then
+            FLA_DOWNLOAD_URL="${GIT_PROXY}${FLA_DOWNLOAD_URL}"
+          fi
+          curl --fail --location --show-error --silent --retry 3 --retry-delay 5 --retry-all-errors \
+            "$FLA_DOWNLOAD_URL" -o "/tmp/$FLA_WHL"
+          echo "$FLA_SHA256  /tmp/$FLA_WHL" | sha256sum --check
+          uv pip install --no-deps "/tmp/$FLA_WHL"
+          python3 -c "import fla_npu.ops.ascendc"
+          rm -f "/tmp/$FLA_WHL"
+
+      - name: Verify required AscendC custom ops are registered
+        if: ${{ matrix.group.npu_type != 'cpu' }}
         run: |
           python - <<'PY'
           import sys, torch
           import vllm_ascend.vllm_ascend_C  # noqa: F401
           ops = torch.ops._C_ascend
-          missing = [n for n in ("chunk_gated_delta_rule_fwd_h", "chunk_fwd_o") if not hasattr(ops, n)]
+          missing = [n for n in ("chunk_gated_delta_rule_fwd_h_vllm", "chunk_fwd_o_vllm") if not hasattr(ops, n)]
           if missing:
               print(f"::error::Missing AscendC ops after install: {missing}. "
                     f"Cache contents are stale or build skipped registration.", file=sys.stderr)
               sys.exit(1)
           print("AscendC chunk-gdr ops registered:",
-                [n for n in ("chunk_gated_delta_rule_fwd_h", "chunk_fwd_o") if hasattr(ops, n)])
+                [n for n in ("chunk_gated_delta_rule_fwd_h_vllm", "chunk_fwd_o_vllm") if hasattr(ops, n)])
           PY
 
       - name: Install vllm-project/vllm-ascend no device
@@ -263,9 +343,22 @@ jobs:
         env:
           SOC_VERSION: ascend910b1
           COMPILE_CUSTOM_KERNELS: 0
+          GIT_PROXY: https://gh-proxy.test.osinfra.cn/
         run: |
+          set -euo pipefail
           pip install uc-manager
           uv pip install -r requirements-dev.txt
+          FLA_WHL=flash_linear_attention_npu_a3-26.9.1-py3-none-manylinux_2_34_x86_64.whl
+          FLA_SHA256=18b8c9d54eadbefb264fd5989577e3bbdb6f2e5cfc8d60d86a0887f2d8a2f26a
+          FLA_DOWNLOAD_URL="https://github.com/flashserve/flash-linear-attention-npu/releases/download/v26.9.1-release/$FLA_WHL"
+          if [ -n "${GIT_PROXY:-}" ]; then
+            FLA_DOWNLOAD_URL="${GIT_PROXY}${FLA_DOWNLOAD_URL}"
+          fi
+          curl --fail --location --show-error --silent --retry 3 --retry-delay 5 --retry-all-errors \
+            "$FLA_DOWNLOAD_URL" -o "/tmp/$FLA_WHL"
+          echo "$FLA_SHA256  /tmp/$FLA_WHL" | sha256sum --check
+          uv pip install --no-deps "/tmp/$FLA_WHL"
+          rm -f "/tmp/$FLA_WHL"
           uv pip install -e .
 
       - name: Uninstall Triton for 310P tests

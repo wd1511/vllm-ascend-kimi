@@ -212,7 +212,7 @@ __aicore__ inline void MmadCompute(const LocalTensor<DstType> &cL0Tensor, const 
 
 template <typename DstType, typename SrcType, bool outSplitN = false>
 __aicore__ inline void FixL0CToDst(const LocalTensor<DstType> &outTensor, const LocalTensor<SrcType> &cL0Tensor,
-                                   const FixL0CToDstParams &fixL0CToDstParams)
+                                   const FixL0CToDstParams &fixL0CToDstParams, bool epilogueSingleCore)
 {
     AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fixParams;
     fixParams.params.ndNum = 1;
@@ -222,7 +222,18 @@ __aicore__ inline void FixL0CToDst(const LocalTensor<DstType> &outTensor, const 
     fixParams.dstStride = fixL0CToDstParams.outNSize;
     fixParams.unitFlag = UNIT_FLAG_UPDATE;
     fixParams.quantPre = QuantMode_t::NoQuant;
-    fixParams.dualDstCtl = 1;
+    // sv3（AIV 双角色拆分）：dualDstCtl=1 为「切 M 对半分投两颗 AIV 各自 LCM」；
+    // epilogue 收归单核后改为 dualDstCtl=0（单目的地）+ subBlockId 选定 epilogue 专核
+    // （sub 1），整 [mL1 x nL1] F32 tile 行主序写入其 relay 区，行布局与分投版逐字节一致。
+    // sv3_cont：epilogueSingleCore=false（小 M 原始模式）恢复 dualDstCtl=1 对半分投两核
+    // （round_1 原始语义，subBlockId 彼模式下无意义，恒 0 与原实现一致）。
+    if (epilogueSingleCore) {
+        fixParams.dualDstCtl = 0;
+        fixParams.subBlockId = true;
+    } else {
+        fixParams.dualDstCtl = 1;
+        fixParams.subBlockId = false;
+    }
     AscendC::Fixpipe<DstType, SrcType, CFG_ROW_MAJOR_UB>(outTensor, cL0Tensor, fixParams);
 }
 

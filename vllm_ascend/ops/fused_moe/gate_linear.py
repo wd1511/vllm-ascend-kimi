@@ -21,14 +21,36 @@ import torch
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
+from vllm_ascend.ops.linear import AscendReplicatedLinear
+
 
 class AscendGateLinear(GateLinear):
-    """Ascend replacement for vLLM GateLinear.
-    Router logits are sensitive to numerical precision because they directly
-    affect expert selection in MoE models. On NPU, computing the router gate in
-    lower precision may lead to accuracy issues in some agent workloads.
-    Therefore, this layer forces the gate input and weights to fp32 for the
-    router linear computation, and keeps the router logits in fp32.
+    """Ascend GateLinear: NPU counterpart of upstream's GEMM dispatch.
+
+    Upstream tiers 1-3 are CUDA/ROCm cuteDSL kernels (unavailable on NPU);
+    this override keeps tier 4 and the tier 5 fallback:
+
+    - Tier 4: bf16 x bf16 with fp32 accumulation via torch.mm's out_dtype
+      epilogue (aclnnMm MatMulV3 on NPU, cf. the cuBLAS/hipBLASLt epilogue
+      upstream dispatches to). Each bf16 x bf16 product has at most 16
+      significant bits and is exact in the fp32 accumulator, so for
+      bf16-origin operands this is numerically equivalent to the fp32
+      upcast path, and ~6x faster at decode-time router shapes (e.g.
+      K=7168 / N=896 on Kimi K3).
+    - Tier 5: the ReplicatedLinear fallback with upstream's dtype
+      semantics: cast x to the weight dtype, compute, cast the output to
+      out_dtype.
+
+    ``out_dtype`` defaults to fp32 on NPU when the model passes None
+    (upstream leaves None and computes natively): the fp32-logits
+    contract keeps downstream NPU topk kernels on their validated path
+    and lets bf16-weight models (upstream DeepSeek-V2 / GLM5Next wiring)
+    take tier 4 directly.
+
+    A forced fp32 router stays fp32: models opt in explicitly via
+    params_dtype=torch.float32 / force_fp32_compute (e.g. MiniMax-M3), or
+    via the Ascend-specific precast_fp32_weight path (DSV4), which the MoE
+    runner routes around this forward entirely.
     """
 
     def __init__(
@@ -41,60 +63,43 @@ class AscendGateLinear(GateLinear):
         force_fp32_compute: bool = False,
         prefix: str = "",
     ):
-        super().__init__(
-            input_size=input_size,
-            output_size=output_size,
+        # Mirror upstream GateLinear.__init__: with no NPU specialized
+        # kernel available, force_fp32_compute means storing the weight in
+        # fp32 so the fallback tier computes in fp32.
+        if force_fp32_compute:
+            params_dtype = torch.float32
+        # Skip GateLinear.__init__ (CUDA/ROCm GEMM probes); weights follow
+        # the model dtype unless explicitly upcast.
+        AscendReplicatedLinear.__init__(
+            self,
+            input_size,
+            output_size,
             bias=bias,
-            params_dtype=torch.float32,
-            out_dtype=out_dtype,
-            force_fp32_compute=True,
+            params_dtype=params_dtype,
+            quant_config=None,
             prefix=prefix,
         )
+        # NPU default: fp32 logits when out_dtype is None (see class
+        # docstring); out_dtype is immutable afterwards.
+        self.out_dtype = out_dtype if out_dtype is not None else torch.float32
 
     def forward(self, x: torch.Tensor):
-        # TODO: Remove this workaround after upgrading to a vLLM version that
-        # no longer forces router logits to bf16 via
-        # self.gate.set_out_dtype(torch.bfloat16).
-        if x.dtype != torch.float32:
-            x = x.to(torch.float32)
-
-        output, output_bias = ReplicatedLinear.forward(self, x)
-
-        return output, output_bias
-
-
-class AscendKimiGateLinear(GateLinear):
-    """Kimi-K3 router gate matching the recipes BF16 router GEMM.
-
-    The recipes baseline computes ``torch.mm(x, weight.t(), out_dtype=fp32)``
-    directly from the BF16 RMSNorm output. Keep the same data path here so the
-    router GEMM does not materialize an FP32 copy of the activations, while the
-    router logits stay FP32 for ``npu_moe_gating_top_k``.
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        out_dtype: torch.dtype | None = torch.float32,
-        prefix: str = "",
-    ):
-        super().__init__(
-            input_size=input_size,
-            output_size=output_size,
-            bias=bias,
-            params_dtype=torch.bfloat16,
-            out_dtype=out_dtype,
-            force_fp32_compute=False,
-            prefix=prefix,
-        )
-
-    def forward(self, x: torch.Tensor):
-        if x.device.type != "npu":
-            # CPU paths (unit tests) emulate the NPU op's FP32 accumulation
-            # without torch_npu's ``out_dtype`` extension.
-            return torch.mm(x.float(), self.weight.t().float()), None
+        # Tier 4: bf16 x bf16 -> fp32 accumulation. Eligibility mirrors
+        # upstream: bf16 weight (i.e. no fp32 upcast requested), fp32
+        # out_dtype, no bias (torch.mm has no bias term).
+        if (
+            self.weight.dtype == torch.bfloat16
+            and x.dtype == torch.bfloat16
+            and self.out_dtype == torch.float32
+            and self.bias is None
+        ):
+            return torch.mm(x, self.weight.t(), out_dtype=torch.float32), None
+        # Tier 5: cast x to the weight dtype, compute, cast the output to
+        # out_dtype (upstream fallback semantics; out_dtype is always set
+        # after __init__).
         if x.dtype != self.weight.dtype:
-            return super().forward(x)
-        return torch.mm(x, self.weight.t(), out_dtype=torch.float32), None
+            x = x.to(self.weight.dtype)
+        output, output_bias = ReplicatedLinear.forward(self, x)
+        if output.dtype != self.out_dtype:
+            output = output.to(self.out_dtype)
+        return output, output_bias

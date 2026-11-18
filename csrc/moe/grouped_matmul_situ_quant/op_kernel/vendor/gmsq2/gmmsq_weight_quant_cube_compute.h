@@ -62,7 +62,8 @@ public:
     __aicore__ inline void SetScaleMTE1ToMTE2(uint64_t kbGmOffset, const BasicBlockOffsetParam &offsetParam);
     __aicore__ inline void CopyAGmToL1(const BasicBlockOffsetParam &param, int64_t kaGmOffset);
     __aicore__ inline void CopyMxScaleGmToL1(const BasicBlockOffsetParam &param, uint64_t kbL1Offset);
-    __aicore__ inline void GetTensorC(LocalTensor<yType> &yUb, const BasicBlockOffsetParam &param);
+    __aicore__ inline void GetTensorC(LocalTensor<yType> &yUb, const BasicBlockOffsetParam &param,
+                                      bool epilogueSingleCore);
     __aicore__ inline void PadL1IfNotAlign(const LocalTensor<xType> &l1Buf, uint64_t dbOffset, uint64_t dbIdx,
                                            uint64_t realSize, uint64_t dimSize);
     __aicore__ inline void EndSync();
@@ -419,7 +420,8 @@ __aicore__ inline void GMMSQ_WQ_CUBE_COMPUTE_CLASS::FillL1WithZero(const LocalTe
 
 GMMSQ_WQ_CUBE_COMPUTE_TEMPLATE_PARAM
 __aicore__ inline void GMMSQ_WQ_CUBE_COMPUTE_CLASS::GetTensorC(LocalTensor<yType> &yUb,
-                                                               const BasicBlockOffsetParam &param)
+                                                               const BasicBlockOffsetParam &param,
+                                                               bool epilogueSingleCore)
 {
     FixL0CToDstParams fixL0CToDstParams;
     fixL0CToDstParams.mL0Size = param.mL1Size;
@@ -427,7 +429,10 @@ __aicore__ inline void GMMSQ_WQ_CUBE_COMPUTE_CLASS::GetTensorC(LocalTensor<yType
     fixL0CToDstParams.outNSize = param.nL1Size;
     fixL0CToDstParams.splitNSize = 0;
     fixL0CToDstParams.dstNdStride = 0;
-    FixL0CToDst(yUb, l0c_[l0cOffset_], fixL0CToDstParams);
+    // sv3：整 tile fixpipe 到 epilogue 专核（sub 1）的 relay 区（原 dualDstCtl=1 按 M 对半
+    // 分投两核；epilogue 收归 sub 1 后单投，行布局不变）
+    // sv3_cont：epilogueSingleCore=false（原始模式）恢复 dualDstCtl=1 对半分投
+    FixL0CToDst(yUb, l0c_[l0cOffset_], fixL0CToDstParams, epilogueSingleCore);
     l0cOffset_ += Ops::Base::CeilAlign(fixL0CToDstParams.mL0Size, static_cast<uint64_t>(BLOCK_CUBE)) *
                   CeilAlign(fixL0CToDstParams.nL0Size, static_cast<uint64_t>(BLOCK_CUBE));
 }

@@ -17,6 +17,7 @@ constexpr size_t ATTR_BETA_INDEX = 1;
 constexpr size_t ATTR_LINEAR_BETA_INDEX = 2;
 constexpr uint32_t BASE_M = 128;
 constexpr uint32_t MAIN_BLOCK_N2 = 64;
+constexpr uint32_t MAIN_BLOCK_N2_WIDE = 128; // nk_tile: N/K 联合 tile（nL1=256×kbL1=256 对照）
 constexpr uint32_t TENSOR_LIST_FLAG = 1U << 1;
 
 struct GroupedMatmulSituQuantCompileInfo {};
@@ -112,10 +113,15 @@ ge::graphStatus Tiling4GroupedMatmulSituQuant(gert::TilingContext *context)
     tiling.kSize = static_cast<uint32_t>(k);
     tiling.nSize = static_cast<uint32_t>(n);
     tiling.baseM = BASE_M;
-    tiling.mainBlockSize = MAIN_BLOCK_N2;
+    // nk_tile N/K 联合 tile：设备侧 nL1Size = mainBlockSize×2（gate/up 两半）。
+    // 块宽 128 → nL1=256；kbL1 由既有生产动态规则自动落到 256（nL1>128 分支），
+    // B 单槽 nL1Align×kbL1 = 256×256 fp8 = 64KB，与基线 128×512 同容量（W 槽定容不变）。
+    // 通用回退：n2 不被 128 整除时保持基线块宽 64，不缩小合法 shape 覆盖面。
+    const uint32_t mainBlockN2 = (n2 % MAIN_BLOCK_N2_WIDE == 0) ? MAIN_BLOCK_N2_WIDE : MAIN_BLOCK_N2;
+    tiling.mainBlockSize = mainBlockN2;
     tiling.firstTailBlockSize = 0;
     tiling.reserved = static_cast<uint32_t>(*groupListType) | (isTensorList ? TENSOR_LIST_FLAG : 0U);
-    tiling.mainBlockCount = static_cast<uint64_t>(n2 / MAIN_BLOCK_N2);
+    tiling.mainBlockCount = static_cast<uint64_t>(n2 / mainBlockN2);
     tiling.firstTailBlockCount = 0;
     tiling.beta = *beta;
     tiling.invBeta = 1.0f / *beta;

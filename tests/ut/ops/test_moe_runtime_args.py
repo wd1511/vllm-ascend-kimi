@@ -16,12 +16,10 @@
 #
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-from vllm_ascend.ops.fused_moe import moe_comm_method
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import build_mlp_compute_input
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
@@ -30,7 +28,6 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
     build_token_dispatch_input,
 )
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import AscendDeviceType
 
 MXFP4_TEST_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.float16)
 
@@ -46,56 +43,6 @@ def _get_test_mxfp_dtype(quant_type: QuantType) -> torch.dtype | None:
 
 
 class TestMoERuntimeArgs(unittest.TestCase):
-    def test_situ_count_request_is_limited_to_supported_a5_operators(self):
-        config = SimpleNamespace(
-            activation=MoEActivation.SITU,
-            activation_situ_beta=4.0,
-            activation_situ_linear_beta=25.0,
-        )
-        fused_input = SimpleNamespace(
-            quant=SimpleNamespace(quant_type=QuantType.W4A8MXFP, is_per_channel_weight=False),
-            hidden_states=torch.empty(1, 8, dtype=torch.bfloat16),
-            lora_context=None,
-            dynamic_eplb=False,
-        )
-        registered_ops = SimpleNamespace(grouped_situ_mx_quant=object(), npu_situ_and_mul_sparse=object())
-        with (
-            patch.object(moe_comm_method, "get_ascend_device_type", return_value=AscendDeviceType.A5) as device_type,
-            patch.object(moe_comm_method.torch.ops, "custom", registered_ops),
-        ):
-            prefer_counts = moe_comm_method._prefer_expert_token_counts_for_situ
-            self.assertTrue(prefer_counts(config, fused_input))
-            fused_input.quant.is_per_channel_weight = True
-            self.assertFalse(prefer_counts(config, fused_input))
-            fused_input.quant.is_per_channel_weight = False
-            fused_input.quant.quant_type = QuantType.NONE
-            self.assertTrue(prefer_counts(config, fused_input))
-            fused_input.hidden_states = fused_input.hidden_states.half()
-            self.assertTrue(prefer_counts(config, fused_input))
-            fused_input.hidden_states = fused_input.hidden_states.float()
-            self.assertFalse(prefer_counts(config, fused_input))
-            fused_input.hidden_states = fused_input.hidden_states.bfloat16()
-            config.activation = MoEActivation.SILU
-            self.assertFalse(prefer_counts(config, fused_input))
-            config.activation = MoEActivation.SITU
-            fused_input.lora_context = object()
-            self.assertFalse(prefer_counts(config, fused_input))
-            fused_input.lora_context = None
-            fused_input.dynamic_eplb = True
-            self.assertFalse(prefer_counts(config, fused_input))
-            fused_input.dynamic_eplb = False
-            config.activation_situ_linear_beta = None
-            self.assertFalse(prefer_counts(config, fused_input))
-            config.activation_situ_linear_beta = 25.0
-            config.activation_situ_beta = -1.0
-            self.assertFalse(prefer_counts(config, fused_input))
-            config.activation_situ_beta = 4.0
-            device_type.return_value = AscendDeviceType.A3
-            self.assertFalse(prefer_counts(config, fused_input))
-            device_type.return_value = AscendDeviceType.A5
-            with patch.object(moe_comm_method.torch.ops, "custom", SimpleNamespace()):
-                self.assertFalse(prefer_counts(config, fused_input))
-
     def test_build_mlp_compute_input_preserves_situ_parameters(self):
         fused_experts_input = build_fused_experts_input(
             hidden_states=torch.randn(2, 4),
@@ -233,11 +180,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
         self.assertIs(token_dispatch_input.topk_weights, fused_experts_input.topk_weights)
         self.assertIs(token_dispatch_input.routing, fused_experts_input.routing)
         self.assertIs(token_dispatch_input.quant, fused_experts_input.quant)
-        self.assertFalse(token_dispatch_input.prefer_expert_token_counts)
-        requested_counts = build_token_dispatch_input(
-            fused_experts_input=fused_experts_input, prefer_expert_token_counts=True
-        )
-        self.assertTrue(requested_counts.prefer_expert_token_counts)
 
     def test_build_fused_experts_input_requires_primitive_mxfp_params_for_mxfp_quant(self):
         for quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP, QuantType.W4A8MXFP):
@@ -276,7 +218,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     mxfp_scale_dtype=torch.float32,
                     mxfp_per_token_scale_dtype=torch.float16,
                     mxfp_use_bf16=False,
-                    mxfp_group_size=32,
                     w1_scale=[torch.randn(1)],
                     w2_scale=[torch.randn(1)],
                 )
@@ -310,7 +251,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertEqual(mlp_compute_input.quant.mxfp.scale_dtype, torch.float32)
                 self.assertEqual(mlp_compute_input.quant.mxfp.per_token_scale_dtype, torch.float16)
                 self.assertFalse(mlp_compute_input.quant.mxfp.use_bf16)
-                self.assertEqual(mlp_compute_input.quant.mxfp.group_size, 32)
 
     def test_build_fused_experts_input_constructs_internal_mxfp_leaf_from_primitives(self):
         for quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP):
@@ -329,7 +269,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     mxfp_scale_dtype=torch.float32,
                     mxfp_per_token_scale_dtype=torch.float16,
                     mxfp_use_bf16=False,
-                    mxfp_group_size=32,
                 )
 
                 self.assertTrue(fused_experts_input.quant.is_mxfp)
@@ -339,7 +278,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertEqual(fused_experts_input.quant.mxfp.scale_dtype, torch.float32)
                 self.assertEqual(fused_experts_input.quant.mxfp.per_token_scale_dtype, torch.float16)
                 self.assertFalse(fused_experts_input.quant.mxfp.use_bf16)
-                self.assertEqual(fused_experts_input.quant.mxfp.group_size, 32)
 
 
 if __name__ == "__main__":

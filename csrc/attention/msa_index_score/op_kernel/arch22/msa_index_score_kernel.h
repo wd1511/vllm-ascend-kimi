@@ -23,20 +23,20 @@
 
 #include "kernel_operator.h"
 
-#include "catlass/msa_catlass.hpp"
-#include "catlass/arch/msa_arch.hpp"
-#include "catlass/arch/msa_resource.hpp"
-#include "catlass/arch/msa_cross_core_sync.hpp"
-#include "catlass/msa_coord.hpp"
-#include "catlass/msa_gemm_coord.hpp"
-#include "catlass/msa_matrix_coord.hpp"
-#include "catlass/layout/msa_layout.hpp"
-#include "catlass/gemm/msa_gemm_type.hpp"
+#include "catlass/catlass.hpp"
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/resource.hpp"
+#include "catlass/arch/cross_core_sync.hpp"
+#include "catlass/coord.hpp"
+#include "catlass/gemm_coord.hpp"
+#include "catlass/matrix_coord.hpp"
+#include "catlass/layout/layout.hpp"
+#include "catlass/gemm/gemm_type.hpp"
 
 #include "../msa_index_score_common.h"
 #include "msa_block_mmad.h"
 #include "msa_index_score_task.h"
-#include "msa_seg_row_max_epilogue.h"
+#include "msa_index_score_epilogue.h"
 
 namespace MsaIndexScoreNs {
 
@@ -175,19 +175,19 @@ private:
         if constexpr (IS_QUANT_V) {
             const uint32_t slot = st % MSA_K_SCRATCH_STAGES_A2;
             if (slot == 0U) {
-                Catlass::Arch::CrossCoreWaitFlag<0x2, PIPE_MTE2>(flagK0);
+                Catlass::Arch::CrossCoreWaitFlag(flagK0);
             } else if (slot == 1U) {
-                Catlass::Arch::CrossCoreWaitFlag<0x2, PIPE_MTE2>(flagK1);
+                Catlass::Arch::CrossCoreWaitFlag(flagK1);
             } else if (slot == 2U) {
-                Catlass::Arch::CrossCoreWaitFlag<0x2, PIPE_MTE2>(flagK2);
+                Catlass::Arch::CrossCoreWaitFlag(flagK2);
             } else {
-                Catlass::Arch::CrossCoreWaitFlag<0x2, PIPE_MTE2>(flagK3);
+                Catlass::Arch::CrossCoreWaitFlag(flagK3);
             }
         } else {
             (void)flagK1;
             (void)flagK2;
             (void)flagK3;
-            Catlass::Arch::CrossCoreWaitFlag<0x2, PIPE_MTE2>(flagK0);
+            Catlass::Arch::CrossCoreWaitFlag(flagK0);
         }
     }
 

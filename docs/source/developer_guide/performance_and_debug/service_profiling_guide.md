@@ -138,30 +138,6 @@ curl -X POST http://<decoder_ip>:<decoder_port>/stop_profile
 
     The EPD proxy (`epd_load_balance_proxy_layerwise_server_example.py`) **does** support broadcasting profiling commands to all E/P/D instances.
 
-### 6. Decode-only Profiling (Experimental)
-
-In PD-mixed deployments, a trace can contain prefill, PD-mixed batches, dummy runs, and decode steps. To record only pure decode steps, enable the decode-only switch at startup:
-
-```bash
-vllm serve <model> \
-  --profiler-config '{
-    "profiler": "torch",
-    "torch_profiler_dir": "/data/vllm_profile",
-    "torch_profiler_with_stack": false,
-    "ignore_frontend": true
-  }' \
-  --additional-config '{"profiler_decode_only": true}'
-```
-
-Semantics:
-
-- Only steps whose entire batch is decode are recorded. A step is skipped if it contains a new request that has not finished prefill, a context-phase/chunked prefill request, encoder inputs, a resumed/preempted request, or any request with more than one valid (non-draft) token.
-- In PD-disaggregated deployments, enable the switch on the Decoder only. The Prefiller has no decode steps and will produce no decode trace.
-- If every step in a PD-mixed instance contains both prefill and decode, strict decode-only mode records nothing. Create a pure decode window (for example, finish prefill before starting collection) or use PD disaggregation.
-- `profiler_decode_only` forces `ignore_frontend=true`, so the AsyncLLM frontend CPU trace does not contain prefill/dummy request processing. The example sets it explicitly for clarity.
-- Each contiguous decode phase creates its own worker trace directory with a `_decode_only` suffix. If prefill and decode alternate, multiple trace directories are generated; each one can be parsed independently with `torch_npu.profiler.profiler.analyse`. Trace metadata contains `decode_only=true`, the decode phase index, and decode/skip step counts.
-- Decode-only sessions do not run automatic analysis when a phase stops, to avoid blocking inference between phases. Run `torch_npu.profiler.profiler.analyse` on each `*_decode_only*` directory after collection.
-
 ---
 
 ## MS Service Profiler  
