@@ -109,6 +109,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
         self.norm_eps = config.rms_norm_eps
+        self.hc_norm = RMSNorm(hc_dim, eps=config.rms_norm_eps, has_weight=False, dtype=torch.float32)
 
     def forward(
         self,
@@ -169,8 +170,8 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = torch.nn.functional.linear(x, hc_fn) * rsqrt
+        x_norm = self.hc_norm(x)
+        mixes = torch.nn.functional.linear(x_norm, hc_fn)
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
@@ -264,6 +265,7 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
+        self.num_moe_layers = len(self.moe_layers)
         self.extract_moe_parameters(example_moe)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -371,12 +373,18 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
 
             if "sink" in name:
                 param = params_dict[name]
+                # Route the write through the parameter's loader: a live weight
+                # update runs inside vLLM's layerwise reload, which parks the
+                # layer on the meta device and only replays loads made through
+                # ``weight_loader``. A direct ``param.data.copy_`` lands on the
+                # meta tensor and is lost, leaving the sink at its dummy value.
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if enable_dsa_cp():
-                    param.data.copy_(loaded_weight)
+                    weight_loader(param, loaded_weight)
                 else:
                     # Handle attention sinks (distributed across ranks)
                     narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
-                    param.data.copy_(narrow_weight)
+                    weight_loader(param, narrow_weight)
                 loaded_params.add(name)
                 continue
 

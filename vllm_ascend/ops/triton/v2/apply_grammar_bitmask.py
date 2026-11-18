@@ -29,12 +29,14 @@ def _apply_grammar_bitmask_kernel_impl(
     logits_ptr,
     logits_stride,
     logits_indices_ptr,
+    cu_num_logits_ptr,
     bitmask_ptr,
     bitmask_stride,
     vocab_size,
     total_tasks,
     NUM_PROGRAMS: tl.constexpr,
     NUM_VOCAB_BLOCKS: tl.constexpr,
+    MASK_STRIDE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -49,7 +51,18 @@ def _apply_grammar_bitmask_kernel_impl(
     for task_id in tl.range(task_start, task_end):
         bitmask_idx = task_id // NUM_VOCAB_BLOCKS
         block_id = task_id - bitmask_idx * NUM_VOCAB_BLOCKS
-        logits_idx = tl.load(logits_indices_ptr + bitmask_idx)
+
+        # Each mapping entry packs (req_idx, position) as
+        # req_idx * MASK_STRIDE + position; the absolute logit row is
+        # resolved on device from cu_num_logits (adaptive verification
+        # finalizes per-request logit offsets there).
+        mapping_idx = tl.load(logits_indices_ptr + bitmask_idx)
+        req_idx = mapping_idx // MASK_STRIDE
+        position_idx = mapping_idx % MASK_STRIDE
+        logits_idx = tl.load(cu_num_logits_ptr + req_idx)
+        num_req_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - logits_idx
+        logits_idx += position_idx
+        position_is_active = position_idx < num_req_logits
 
         bitmask_offset = block_id * (BLOCK_SIZE // 32) + tl.arange(0, BLOCK_SIZE // 32)
         packed_bitmask = tl.load(
@@ -61,10 +74,16 @@ def _apply_grammar_bitmask_kernel_impl(
         blocked = blocked.reshape(BLOCK_SIZE)
 
         block_offset = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        store_mask = position_is_active & (block_offset < vocab_size)
+        logits = tl.load(
+            logits_ptr + logits_idx * logits_stride + block_offset,
+            mask=store_mask,
+            other=0.0,
+        )
         tl.store(
             logits_ptr + logits_idx * logits_stride + block_offset,
-            -float("inf"),
-            mask=blocked & (block_offset < vocab_size),
+            tl.where(blocked, -float("inf"), logits),
+            mask=store_mask,
         )
 
 
@@ -82,9 +101,11 @@ class _ApplyGrammarBitmaskKernelLauncher:
             logits_ptr,
             logits_stride,
             logits_indices_ptr,
+            cu_num_logits_ptr,
             bitmask_ptr,
             bitmask_stride,
             vocab_size,
+            MASK_STRIDE,
             BLOCK_SIZE,
         ):
             # Disable MULTIBUFFER to better utilize the UB buffer, which gives
@@ -94,12 +115,14 @@ class _ApplyGrammarBitmaskKernelLauncher:
                 logits_ptr,
                 logits_stride,
                 logits_indices_ptr,
+                cu_num_logits_ptr,
                 bitmask_ptr,
                 bitmask_stride,
                 vocab_size,
                 total_tasks,
                 NUM_PROGRAMS=num_programs,
                 NUM_VOCAB_BLOCKS=num_vocab_blocks,
+                MASK_STRIDE=MASK_STRIDE,
                 BLOCK_SIZE=BLOCK_SIZE,
                 multibuffer=False,
             )

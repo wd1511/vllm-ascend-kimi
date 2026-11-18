@@ -5,7 +5,7 @@ comment command, without running the PR-selected test suite.
 
 ## Background
 
-The `E2E` workflow ([`pr_test.yaml`](https://github.com/vllm-project/vllm-ascend/blob/main/.github/workflows/pr_test.yaml)) runs a PR-selected set of tests when a PR has one of the `ready-precise`, `ready-all`, or `ready-a5` labels.
+The `E2E` workflow ([`pr_test.yaml`](https://github.com/vllm-project/vllm-ascend/blob/main/.github/workflows/pr_test.yaml)) runs a PR-selected set of tests when a PR has one of the `ready-precise`, `ready-all`, `ready-a5`, or `main2main` labels. `main2main` runs the full suite twice, once against the verified vLLM main commit and once against the matched vLLM release tag.
 This is expensive in CI resources and time.
 
 Authorized users can trigger only the specific test files they care about by posting a
@@ -50,8 +50,9 @@ to a logical partition, which selects an exact runner label from `runner_label.j
 |---|---|---|
 | `two_card` in path | two_card A3 NPU | `linux-aarch64-a3-800t-2` |
 | `four_card` in path | four_card A3 NPU | `linux-aarch64-a3-800t-4` |
-| `_310p` in filename under one/two_card | Ascend 310P x1 | `linux-aarch64-310p-*` |
-| `_310p` in filename under four_card | Ascend 310P x4 | `linux-aarch64-310p-*` |
+| `_310p` in filename under one_card | Ascend 310P x1 | `linux-aarch64-310p-1` |
+| `_310p` in filename under two_card | Ascend 310P x2 | `linux-aarch64-310p-2` |
+| `_310p` in filename under four_card | Ascend 310P x4 | `linux-aarch64-310p-4` |
 | All other paths | one_card A2 NPU | `linux-aarch64-a2b3-1` |
 
 When paths from multiple categories are listed in a single comment, each category's
@@ -68,11 +69,11 @@ tests/e2e/pull_request/
 ├── four_card/         # Four card tests → A3 NPU x4 runner
 ```
 
-310P tests use `_310p` subdirectories or `_310p.py` filename suffix under the
-corresponding card directory:
+310P tests use a `_310p` filename under the corresponding card directory:
 
 ```text
 tests/e2e/pull_request/one_card/_310p/   # 310P single card
+tests/e2e/pull_request/two_card/_310p/   # 310P two card
 tests/e2e/pull_request/four_card/_310p/  # 310P four card
 ```
 

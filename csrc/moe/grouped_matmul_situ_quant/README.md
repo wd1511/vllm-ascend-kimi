@@ -1,21 +1,20 @@
-# grouped_matmul_situ_quant (GroupedMatmulSituQuant A5 fused op)
+# GroupedMatmulSituQuant
 
 `GroupedMatmul(MXFP8 x MXFP4) + SiTU + dynamic MX quant` single-launch fused
-custom op for **Ascend950PR (arch35) only**. Fuses the production split chain
-`npu_grouped_matmul + situ_mx_quant` with bit-exact outputs; contract geomean
-2.650x (8/8 >= 1.0), graph-mode ratio 1.06-1.96, delivered 2026-08-25.
+custom op for **Ascend950PR (arch35) only**, imported from PR #15871.
+Fuses the split chain `npu_grouped_matmul + situ_mx_quant`.
 
 ## Layout
 
-- `op_kernel/gmm_situ_vcv_dev.cpp` — device kernel (device group_list,
+- `op_kernel/grouped_matmul_situ_quant.cpp` — device kernel (device group_list,
   graph-capturable static grid, in-kernel pruning)
 - `op_kernel/gmsq_vcv_controller.h`, `op_kernel/situ_epilogue.h` — controller + SiTU/MXQuant epilogue
 - `op_kernel/vendor/{wqbmm,gmsq2}` — vendored official arch35 weight-quant VCV
   data path (self-contained, no external deps)
-- `op_host/gmm_situ_quant_entries.cpp` — host tiling/launch; the four
+- `op_host/grouped_matmul_situ_quant_tiling.cpp` — host tiling; the four
   V2-aligned entries (aclnnGroupedMatmulSwigluQuantV2 API habits; our op
   itself carries no version suffix)
-- `ops.h` / `csrc/torch_binding.cpp` — `_C_ascend` dispatcher registration;
+- `grouped_matmul_situ_quant_torch_adpt.h` / `csrc/torch_binding.cpp` — `_C_ascend` dispatcher registration;
   `csrc/torch_binding_meta.cpp` supplies graph/compile Meta implementations
 - Only the MX A8W4 combo is implemented (Kimi w4a8); `bias`/`smoothScale`
   unsupported by design
@@ -23,22 +22,15 @@ custom op for **Ascend950PR (arch35) only**. Fuses the production split chain
 ## Build / use
 
 The kernel is built and packaged with `vllm_ascend_C` by the normal
-vLLM-Ascend install on `SOC_VERSION=ascend950*`. Python surface:
-`vllm_ascend.ops.grouped_matmul_situ_quant` (SOC gate, ND/NZ dispatch,
-`to_weight_nz` helpers). Tests:
-`tests/ut/ops/test_grouped_matmul_situ_quant.py`.
+vLLM-Ascend install on `SOC_VERSION=ascend950*`. The existing
+`DeviceOperator.npu_grouped_matmul_situ_quant` entry calls
+`torch.ops._C_ascend.grouped_matmul_situ_quant_weight_nz` on A5.
+Tensor-list dispatch uses `.list`; ND entries retain the reference names.
 
-## Source of truth & sync
+The W4A8 MXFP MoE method automatically selects fusion for SiTU, group size 32,
+group-list types 0 (cumulative) or 1 (counts), and positive `linear_beta`.
+W13 is loaded with native FP4 metadata; scales use E8M0 metadata and N-major
+views without copying storage. W2 and the existing GMM2 path are unchanged.
 
-Kernel evolution happens in the external evolution delivery tree. Point
-`GMSQ_P0_KERNEL` at its `p0_entries/kernel` directory before syncing an
-accepted kernel change:
-
-```bash
-GMSQ_P0_KERNEL=/path/to/p0_entries/kernel \
-    bash csrc/moe/grouped_matmul_situ_quant/sync_from_p0.sh
-pip install -e .
-pytest tests/ut/ops/test_grouped_matmul_situ_quant.py
-```
-
-`ops.h` and the root `CMakeLists.txt` integration are not synced.
+The Ascend 950 end-to-end case is in
+`tests/e2e/nightly/single_node/ops/singlecard_ops/test_gmm_situ_small_experts.py`.
