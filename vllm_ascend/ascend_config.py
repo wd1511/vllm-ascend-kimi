@@ -126,6 +126,29 @@ class AscendFusionConfig:
 
 
 @config
+class SyncOptimizationConfig:
+    """Worker-local stream scheduling for DP metadata and completed events.
+
+    Configure under ``additional_config["sync_optimization"]``. Every rank
+    keeps the same collective program order; stream selection never skips a
+    collective or uses a prior step's metadata. Stream priorities follow the
+    torch_npu convention: lower numbers have higher priority.
+    """
+
+    stream_pool_size: int = 2
+    metadata_stream_priority: int = -1
+    enable_event_query_fast_path: bool = True
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if not 1 <= self.stream_pool_size <= 4:
+            raise ValueError("sync_optimization.stream_pool_size must be between 1 and 4")
+        if self.metadata_stream_priority not in (-1, 0):
+            raise ValueError("sync_optimization.metadata_stream_priority must be -1 or 0")
+        return self
+
+
+@config
 class EplbConfig:
     """Configuration Object for ``additional_config["eplb_config"]``.
 
@@ -169,8 +192,8 @@ class EplbConfig:
                 raise TypeError(f"{key} must be an integer")
             if value < 0:
                 raise ValueError(f"{key} must greater than 0; got {value} instead")
-        if self.eplb_policy_type not in [0, 1, 2, 3]:
-            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+        if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
+            raise ValueError("eplb_policy_type must in [0, 1, 2, 3, 4]")
         if self.dynamic_eplb:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
@@ -307,6 +330,11 @@ class AscendConfig:
             },
             "ascend_fusion_config": {
                 "fusion_ops_gmmswigluquant": true
+            },
+            "sync_optimization": {
+                "stream_pool_size": 2,
+                "metadata_stream_priority": -1,
+                "enable_event_query_fast_path": true
             },
             "eplb_config": {
                 "dynamic_eplb": false,
@@ -473,6 +501,7 @@ class AscendConfig:
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
     ascend_fusion_config: AscendFusionConfig = dataclasses.field(default_factory=AscendFusionConfig)
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
+    sync_optimization: SyncOptimizationConfig = dataclasses.field(default_factory=SyncOptimizationConfig)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
 

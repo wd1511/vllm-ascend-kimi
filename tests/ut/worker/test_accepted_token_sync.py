@@ -119,19 +119,31 @@ class TestAcceptedTokenSynchronization(unittest.TestCase):
             bases=(cls.runner_class,),
         )
 
-    def _make_runner(self, runner_class=None, counts=(2, 4, 7, 8), previous=(1, 0), asynchronous=True, event=True):
+    def setUp(self):
+        self.npu = SimpleNamespace(is_current_stream_capturing=MagicMock(return_value=False))
+        patcher = patch.object(torch, "npu", self.npu, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_runner(
+        self, runner_class=None, counts=(2, 4, 7, 8), previous=(1, 0), asynchronous=True, event=True, completed=False
+    ):
         runner = (runner_class or self.runner_class)()
         trace = []
-        ready = [not event]
+        ready = [not event or completed]
         runner.num_accepted_tokens = _Buffer(counts, trace, lambda: ready[0])
         runner.prev_positions = _Buffer(previous)
         runner.use_async_scheduling = asynchronous
+        runner.ascend_config = SimpleNamespace(
+            sync_optimization=SimpleNamespace(enable_event_query_fast_path=True)
+        )
         runner.input_batch = SimpleNamespace(
             num_accepted_tokens_cpu=np.array([9, 8, 7, 6], dtype=np.int32),
             prev_req_id_to_index={"previous-request": 0},
         )
         runner.num_accepted_tokens_event = MagicMock() if event else None
         if event:
+            runner.num_accepted_tokens_event.query.return_value = completed
 
             def finish_d2h():
                 trace.append("host_sync")
@@ -204,6 +216,51 @@ class TestAcceptedTokenSynchronization(unittest.TestCase):
         np.testing.assert_array_equal(runner.num_accepted_tokens.np, [4, 2, 1, 1])
         np.testing.assert_array_equal(runner.input_batch.num_accepted_tokens_cpu[:2], [4, 2])
         torch.testing.assert_close(runner.num_accepted_tokens.gpu, torch.tensor([4, 2, 1, 1], dtype=torch.int32))
+
+    def test_completed_event_skips_host_wait_and_still_remaps_and_uploads(self):
+        runner, trace = self._make_runner(completed=True)
+        runner._sync_num_accepted_tokens = MagicMock(wraps=runner._sync_num_accepted_tokens)
+        runner._publish_num_accepted_tokens_before_mamba(2)
+        runner.num_accepted_tokens_event.query.assert_called_once_with()
+        runner.num_accepted_tokens_event.synchronize.assert_not_called()
+        runner._sync_num_accepted_tokens.assert_called_once_with(2, has_prev_mapping=True)
+        self.assertEqual(trace, ["h2d"])
+        torch.testing.assert_close(runner.num_accepted_tokens.gpu, torch.tensor([4, 2, 1, 1], dtype=torch.int32))
+
+    def test_disabled_fast_path_keeps_original_wait_without_query(self):
+        runner, trace = self._make_runner(completed=True)
+        runner.ascend_config.sync_optimization.enable_event_query_fast_path = False
+        runner._publish_num_accepted_tokens_before_mamba(2)
+        runner.num_accepted_tokens_event.query.assert_not_called()
+        runner.num_accepted_tokens_event.synchronize.assert_called_once_with()
+        self.assertEqual(trace, ["host_sync", "h2d"])
+
+    def test_reused_event_is_queried_again_for_a_new_snapshot(self):
+        runner, trace = self._make_runner(completed=True)
+        runner._publish_num_accepted_tokens_before_mamba(2)
+        ready = [False]
+        runner.num_accepted_tokens.ready = lambda: ready[0]
+        runner.num_accepted_tokens_event.query.return_value = False
+
+        def complete_second_snapshot():
+            trace.append("host_sync")
+            runner.num_accepted_tokens.cpu.copy_(torch.tensor([5, 6, 7, 8], dtype=torch.int32))
+            ready[0] = True
+
+        runner.num_accepted_tokens_event.synchronize.side_effect = complete_second_snapshot
+        runner._publish_num_accepted_tokens_before_mamba(2)
+        self.assertEqual(runner.num_accepted_tokens_event.query.call_count, 2)
+        runner.num_accepted_tokens_event.synchronize.assert_called_once_with()
+        self.assertEqual(trace, ["h2d", "host_sync", "h2d"])
+        torch.testing.assert_close(runner.num_accepted_tokens.gpu, torch.tensor([6, 5, 1, 1], dtype=torch.int32))
+
+    def test_capture_path_keeps_original_wait_without_query(self):
+        runner, trace = self._make_runner(completed=True)
+        self.npu.is_current_stream_capturing.return_value = True
+        runner._publish_num_accepted_tokens_before_mamba(2)
+        runner.num_accepted_tokens_event.query.assert_not_called()
+        runner.num_accepted_tokens_event.synchronize.assert_called_once_with()
+        self.assertEqual(trace, ["host_sync", "h2d"])
 
     def test_publish_handles_synchronous_batch_ownership_and_no_previous_mapping(self):
         for asynchronous, mapping, expected in (

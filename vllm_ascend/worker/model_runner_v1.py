@@ -204,6 +204,7 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     DeviceMetadataTaskProvider,
 )
+from vllm_ascend.worker.metadata_stream_pool import DpMetadataStreamPool
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -363,12 +364,9 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self._synced_batch_contains_decode = False
-        # Resources for the DP metadata exchange on a dedicated side stream;
-        # allocated lazily by _dp_metadata_allreduce_on_side_stream.
-        self._dp_metadata_stream: torch.npu.Stream | None = None
-        self._dp_metadata_event: torch.npu.Event | None = None
-        self._dp_metadata_pinned: torch.Tensor | None = None
-        self._dp_metadata_device: torch.Tensor | None = None
+        # Each worker owns a bounded pool; collective submission stays ordered
+        # on this worker thread while target/draft choose priority lanes.
+        self._dp_metadata_pool: DpMetadataStreamPool | None = None
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -773,7 +771,9 @@ class NPUModelRunner(GPUModelRunner):
         elif envs_ascend.VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM:
             packed_tensor = self._dp_metadata_allreduce_on_compute_stream(num_tokens, cudagraph_mode)
         else:
-            packed_tensor = self._dp_metadata_allreduce_on_side_stream(num_tokens, cudagraph_mode)
+            packed_tensor = self._dp_metadata_allreduce_on_side_stream(
+                num_tokens, cudagraph_mode, is_draft_model=is_draft_model
+            )
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[DP_METADATA_NUM_TOKENS, :]
@@ -816,49 +816,32 @@ class NPUModelRunner(GPUModelRunner):
         return packed_tensor.cpu()
 
     def _dp_metadata_allreduce_on_side_stream(
-        self, num_tokens: int, cudagraph_mode: CUDAGraphMode
+        self, num_tokens: int, cudagraph_mode: CUDAGraphMode, is_draft_model: bool = False
     ) -> torch.Tensor:
-        """Issue the DP metadata exchange on a dedicated side stream.
+        """Exchange metadata on a bounded target/draft priority stream pool.
 
-        The packed metadata is only a few int32 values per DP rank, and its
-        inputs (num_tokens / cudagraph_mode) come from the scheduler output,
-        so the exchange has no data dependency on the compute stream. Issuing
-        [H2D -> all-reduce -> D2H] on a side stream lets the tiny collective
-        execute as soon as the peer DP rank arrives, instead of queueing
-        behind the compute-stream backlog. Under async scheduling this turns
-        the per-step host wait from "previous step fully drains" into "the
-        metadata exchange completes" (8 * dp_size bytes, plus peer/communicator
-        queueing). Every rank issues DP-group collectives
-        in the same program order from the same worker thread, so collective
-        matching across ranks is preserved.
+        All ranks retain the original collective program order. A slot owns
+        its staging and device buffers, and returns a CPU snapshot only after
+        its completion event. The legacy compute-stream path remains available
+        through the existing environment switch.
         """
-        if self._dp_metadata_stream is None:
-            self._dp_metadata_stream = torch.npu.Stream(device=self.device)
-            self._dp_metadata_event = torch.npu.Event()
-            self._dp_metadata_pinned = torch.empty(
-                2, self.dp_size, dtype=torch.int32, pin_memory=self.pin_memory
+        if self._dp_metadata_pool is None:
+            config = self.ascend_config.sync_optimization
+            self._dp_metadata_pool = DpMetadataStreamPool(
+                self.device,
+                self.pin_memory,
+                self.dp_size,
+                pool_size=config.stream_pool_size,
+                urgent_priority=config.metadata_stream_priority,
+                enable_event_query_fast_path=config.enable_event_query_fast_path,
             )
-        pinned = self._dp_metadata_pinned
-        # The previous exchange was synchronized before its caller returned,
-        # so the reused staging buffers are safe to overwrite.
-        pinned.zero_()
-        pinned[0][self.dp_rank] = num_tokens
-        pinned[1][self.dp_rank] = cudagraph_mode.value
-        with torch.npu.stream(self._dp_metadata_stream):
-            if self._dp_metadata_device is None:
-                # Allocate on the stream that owns all uses of this buffer.
-                # H2D overwrites every element, so no compute-stream zero or
-                # cross-stream allocator dependency is needed.
-                self._dp_metadata_device = torch.empty(
-                    2, self.dp_size, dtype=torch.int32, device=self.device
-                )
-            self._dp_metadata_device.copy_(pinned, non_blocking=True)
-            dist.all_reduce(self._dp_metadata_device, group=get_dp_group().device_group)
-            pinned.copy_(self._dp_metadata_device, non_blocking=True)
-            self._dp_metadata_event.record()
-        self._dp_metadata_event.synchronize()
-        # Clone so the returned views cannot alias the reused pinned buffer.
-        return pinned.clone()
+        return self._dp_metadata_pool.exchange(
+            num_tokens,
+            cudagraph_mode.value,
+            self.dp_rank,
+            get_dp_group().device_group,
+            urgent=not is_draft_model,
+        )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -1020,7 +1003,16 @@ class NPUModelRunner(GPUModelRunner):
         own input preparation override this hook to avoid remapping twice.
         """
         if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
+            # An already completed event establishes CPU visibility without
+            # another blocking API. Pending events retain the original wait;
+            # capture paths keep the original protocol as well.
+            query_fast_path = self.ascend_config.sync_optimization.enable_event_query_fast_path
+            if (
+                not query_fast_path
+                or torch.npu.is_current_stream_capturing()
+                or not self.num_accepted_tokens_event.query()
+            ):
+                self.num_accepted_tokens_event.synchronize()
             self._sync_num_accepted_tokens(
                 num_reqs, has_prev_mapping=bool(self.input_batch.prev_req_id_to_index)
             )
