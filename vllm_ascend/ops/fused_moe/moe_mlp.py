@@ -15,6 +15,9 @@
 # This file is a part of the vllm-ascend project.
 
 
+from collections.abc import Callable
+
+import custom_ops  # noqa: F401  # Register recipes custom ops and graph converters.
 import torch
 import torch_npu
 from torch.nn.functional import pad
@@ -51,7 +54,7 @@ def _gmm_swiglu_quant_fusion_enabled(use_mxfp_quant, fusion, dynamic_eplb, activ
     )
 
 
-def _gmm_situ_quant_fusion_enabled(
+def _grouped_situ_mx_quant_supported(
     use_mxfp_quant: bool,
     mxfp_quant_dtype: QuantType | None,
     activation: str | MoEActivation | None,
@@ -233,17 +236,29 @@ def quant_apply_mlp(
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     use_w4a8_per_channel_gmm_swiglu: bool = False,
-) -> torch.Tensor:
+    after_gmm1: Callable | None = None,
+) -> tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None]:
     input_hidden_dtype = hidden_states.dtype
+    # Marked right after GMM1 whenever the activation is a separate op, so an
+    # independent branch (shared-expert down projection) can be released at the
+    # same point as the recipes event-8 ladder.
+    after_gmm1_evt = None
     situ_beta = 1.0 if activation_situ_beta is None else activation_situ_beta
     act_name = getattr(activation, "value", activation)
     is_situ_activation = activation == MoEActivation.SITU
-    use_gmm_situ_quant_fusion = _gmm_situ_quant_fusion_enabled(
+    supports_grouped_situ_mx_quant = _grouped_situ_mx_quant_supported(
         use_mxfp_quant,
         mxfp_quant_dtype,
         activation,
         group_list_type,
         use_w4a8_per_channel_gmm_swiglu,
+    )
+    use_grouped_situ_mx_quant = (
+        supports_grouped_situ_mx_quant
+        and situ_beta > 0
+        and activation_situ_linear_beta is not None
+        and activation_situ_linear_beta > 0
+        and hasattr(torch.ops.custom, "grouped_situ_mx_quant")
     )
     quantize_situ_output = is_situ_activation and mxfp_quant_dtype != QuantType.W4A16MXFP
     use_gmm_swiglu_quant_fusion = _gmm_swiglu_quant_fusion_enabled(
@@ -436,6 +451,7 @@ def quant_apply_mlp(
             group_list=group_list,
             output_dtype=_output_dtype,
         )[0]
+        after_gmm1_evt = torch.npu.current_stream().record_event()
         dispose_tensor(unquantized_hidden_states)
         # act_fn: swiglu
         if activation == MoEActivation.SWIGLUSTEP:
@@ -482,21 +498,7 @@ def quant_apply_mlp(
             # TODO w4a8 scene: dynamic acquisition of dtype in the future
             _output_dtype = torch.bfloat16
 
-        if use_gmm_situ_quant_fusion:
-            hidden_states, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_situ_quant(
-                x=hidden_states,
-                weight=w1,
-                weight_scale=w1_scale,
-                x_scale=pertoken_scale,
-                group_list=group_list,
-                group_list_type=group_list_type,
-                beta=situ_beta,
-                linear_beta=activation_situ_linear_beta or 0.0,
-                mxfp_quant_dtype=mxfp_quant_dtype,
-            )
-            if quantized_hidden_states is not None:
-                dispose_tensor(quantized_hidden_states)
-        elif (
+        if (
             use_w4a8_per_channel_gmm_swiglu
             and enable_custom_op()
             and activation != MoEActivation.SWIGLUSTEP
@@ -590,6 +592,9 @@ def quant_apply_mlp(
                         }
                     )
             hidden_states = torch_npu.npu_grouped_matmul(**gmm1_kwargs)[0]
+            after_gmm1_evt = torch.npu.current_stream().record_event()
+            if after_gmm1 is not None:
+                after_gmm1(after_gmm1_evt)
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
@@ -604,7 +609,15 @@ def quant_apply_mlp(
                 hidden_states = torch.nn.functional.gelu(gate, approximate=approximate) * up
                 hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
             elif is_situ_activation:
-                if quantize_situ_output and use_mxfp_quant:
+                if use_grouped_situ_mx_quant and hidden_states.dtype == torch.bfloat16:
+                    hidden_states, swiglu_out_scale = torch.ops.custom.grouped_situ_mx_quant(
+                        hidden_states,
+                        cumsum_group_list(group_list.to(torch.int64), group_list_type, 1),
+                        beta=situ_beta,
+                        alpha=activation_situ_linear_beta,
+                        high_precision=False,
+                    )
+                elif quantize_situ_output and use_mxfp_quant:
                     hidden_states, swiglu_out_scale = torch.ops._C_ascend.situ_mx_quant(
                         x=hidden_states,
                         beta=situ_beta,
@@ -681,7 +694,7 @@ def quant_apply_mlp(
             fallback_output_dtype=_output_dtype,
             mxfp_quant_dtype=mxfp_quant_dtype,
         )
-    return hidden_states, before_gmm2_evt
+    return hidden_states, before_gmm2_evt, after_gmm1_evt
 
 
 def unquant_apply_mlp(
@@ -703,7 +716,7 @@ def unquant_apply_mlp(
     lora_context=None,
     expanded_row_idx: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None]:
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
@@ -758,11 +771,29 @@ def unquant_apply_mlp(
 
     act_name = getattr(activation, "value", activation)
     if activation == MoEActivation.SITU:
-        gate_up_out = _apply_situ(
-            gate_up_out,
-            beta=1.0 if activation_situ_beta is None else activation_situ_beta,
-            linear_beta=activation_situ_linear_beta,
-        )
+        situ_beta = 1.0 if activation_situ_beta is None else activation_situ_beta
+        if (
+            ASCEND_DEVICE_TYPE == AscendDeviceType.A5
+            and gate_up_out.dtype in (torch.float16, torch.bfloat16)
+            and group_list_type in (0, 1)
+            and situ_beta > 0
+            and activation_situ_linear_beta is not None
+            and activation_situ_linear_beta > 0
+            and hasattr(torch.ops.custom, "npu_situ_and_mul_sparse")
+        ):
+            gate_up_out = torch.ops.custom.npu_situ_and_mul_sparse(
+                gate_up_out,
+                cumsum_group_list(group_list.to(torch.int64), group_list_type, 1),
+                beta=situ_beta,
+                alpha=activation_situ_linear_beta,
+                high_precision=True,
+            )
+        else:
+            gate_up_out = _apply_situ(
+                gate_up_out,
+                beta=situ_beta,
+                linear_beta=activation_situ_linear_beta,
+            )
     elif activation == MoEActivation.SWIGLUOAI:
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
@@ -806,10 +837,12 @@ def unquant_apply_mlp(
             silu_out=gate_up_out,
             lora_routing=lora_routing,
         )
-    return hidden_states, None
+    return hidden_states, None, None
 
 
-def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
+def unified_apply_mlp(
+    *, mlp_compute_input: MoEMlpComputeInput, after_gmm1: Callable | None = None
+) -> tuple[torch.Tensor, torch.npu.Event | None, torch.npu.Event | None]:
     """
     Unified MoE MLP entry.
     Quant path is dispatched by DeviceOperator with explicit typed kernel flags.
@@ -838,6 +871,13 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     swiglu_beta = mlp_compute_input.swiglu_beta
     activation_situ_beta = mlp_compute_input.activation_situ_beta
     activation_situ_linear_beta = mlp_compute_input.activation_situ_linear_beta
+    if after_gmm1 is not None and (
+        mlp_compute_input.quant.quant_type != QuantType.W4A8MXFP
+        or activation != MoEActivation.SITU
+        or dynamic_eplb
+        or mlp_compute_input.lora_context is not None
+    ):
+        raise ValueError("Staged shared down requires split MXFP4 SiTU without EPLB or LoRA.")
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
@@ -919,4 +959,5 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         use_w4a8_per_channel_gmm_swiglu=mlp_compute_input.quant.use_w4a8_per_channel_gmm_swiglu,
+        **({} if after_gmm1 is None else {"after_gmm1": after_gmm1}),
     )

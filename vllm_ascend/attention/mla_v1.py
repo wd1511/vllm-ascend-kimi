@@ -21,6 +21,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -47,6 +48,24 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+from vllm_ascend.ops.flash_mla import (
+    PA_NZ_TILE,
+    _get_bf16_mla_prolog_op,
+    _get_k3_flash_mla_ops,
+    _get_quant_mla_prolog_op,
+    clear_partial_block_tail,
+    flash_mla_metadata,
+    flash_mla_with_kvcache,
+    merged_pa_nz_gather,
+    mla_prolog_no_rope,
+    pa_nz_tile_indices,
+    pack_mxfp8_nz,
+    prepare_partial_block_tail_metadata,
+    quant_flash_mla_metadata,
+    quant_flash_mla_with_kvcache,
+    quant_mla_prolog,
+    write_fp8_cache,
+)
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod, AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -73,6 +92,10 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 # token count limits within the mlapo operator
 MLAPO_MAX_SUPPORTED_TOKENS = 1024
+# FIA v2 pins the sparse_mode=3 atten_mask to exactly this square size
+# (EZ0009); the operator end-aligns the band at each request's kv, so one
+# static mask covers any context length. Query chunks must stay within it.
+FIA_CAUSAL_MASK_SIZE = 2048
 
 
 def _npu_mla_prolog_v3_no_rope(**kwargs):
@@ -180,10 +203,25 @@ class AscendMLADecodeMetadata:
     seq_lens: torch.Tensor
     max_seq_lens: int
     seq_lens_list: list[int]
+    max_query_len: int = 1
     actual_seq_lengths_q: list[int] | None = None
     attn_mask: torch.Tensor | None = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
+    flash_mla_seqused_q: torch.Tensor | None = None
+    flash_mla_cache_seqlens: torch.Tensor | None = None
+    flash_mla_cache_indices: torch.Tensor | None = None
+    flash_mla_metadata: torch.Tensor | None = None
+    flash_mla_tail_metadata: tuple[torch.Tensor, torch.Tensor] | None = None
+    flash_mla_block_table_prepared: bool = False
+    flash_mla_cu_seqlens_q: torch.Tensor | None = None
+    flash_mla_block_table: torch.Tensor | None = None
+    # Optional stream used to build FlashMLA metadata asynchronously.  These
+    # objects are shared by all layers in the attention group.
+    flash_mla_metadata_stream: torch.npu.Stream | None = None
+    flash_mla_metadata_start: torch.npu.Event | None = None
+    flash_mla_metadata_ready: torch.npu.Event | None = None
+    flash_mla_metadata_async: bool = False
 
 
 @dataclass
@@ -296,6 +334,25 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         self.reorder_batch_threshold = self.decode_threshold
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
+        custom_params = getattr(vllm_config.model_config, "custom_params", {}) or {}
+        # The runtime switch is registered in AscendConfig, so it is validated
+        # as part of --additional-config before reaching the attention builder.
+        # Keep model custom_params as a compatibility fallback for the Kimi
+        # reference configuration.
+        self.enable_flash_mla_metadata_stream = bool(
+            get_ascend_config().enable_multi_streams
+            or custom_params.get("enable_multi_streams", False)
+        )
+        self.flash_mla_metadata_stream = None
+        self.flash_mla_metadata_start = None
+        self.flash_mla_metadata_ready = None
+        if self.enable_flash_mla_metadata_stream:
+            # Keep graph capture on the existing stream path.  A separately
+            # created stream must only be used in eager execution unless the
+            # backend explicitly captures it as part of the graph.
+            self.flash_mla_metadata_stream = torch.npu.Stream()
+            self.flash_mla_metadata_start = torch.npu.Event()
+            self.flash_mla_metadata_ready = torch.npu.Event()
         static_forward_context = vllm_config.compilation_config.static_forward_context
         # MLA layers are grouped by RoPE mode before metadata builders are created.
         self.use_mla_rope = static_forward_context[layer_names[0]].impl.use_mla_rope if layer_names else True
@@ -318,6 +375,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.query_lens: torch.Tensor = None
         self.seq_lens: torch.Tensor = None
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        # FlashMLA decode inputs must live at graph-stable addresses: the
+        # captured graph records the addresses of the tensors handed to the
+        # prolog/FlashMLA operators, so every later build (graph replay
+        # included) must update the same storage in place.  Keyed by the
+        # padded row count so each graph capture size keeps its own buffers.
+        self._flash_mla_meta_buffers: dict[int, dict[str, torch.Tensor]] = {}
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -638,6 +701,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         # Notice that num_decodes != num_decode_tokens in SpecDecoding Scenario
         actual_seq_lengths_q = query_start_loc_cpu[1 : self.num_decodes + 1].tolist()
+        decode_query_lens = [
+            int(query_start_loc_cpu[idx + 1]) - int(query_start_loc_cpu[idx]) for idx in range(self.num_decodes)
+        ]
+        max_query_len = max(decode_query_lens, default=1)
         max_seq_lens = self.seq_lens[: self.num_decodes].max().item()
         self.seq_lens = self.seq_lens[: self.num_decodes]
         input_positions = input_positions[: self.num_decode_tokens]
@@ -697,16 +764,75 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             sin = sin[: self.num_decode_tokens, ...]
         else:
             cos = sin = None
+        # Keep the FlashMLA decode inputs at graph-stable addresses.  The
+        # captured graph records the addresses of the tensors passed to the
+        # prolog/FlashMLA operators, so every later build (graph replay
+        # included) must update the same storage in place instead of
+        # producing fresh tensors: the seqused_q subtraction and the graph
+        # padding below both allocate, which would leave the captured graph
+        # reading stale capture-time inputs at replay.
+        num_rows = self.block_table.shape[0]
+        seq_device = common_attn_metadata.seq_lens.device
+        flash_buffers = self._flash_mla_meta_buffers.get(num_rows)
+        if flash_buffers is None:
+            cu_dtype = common_attn_metadata.query_start_loc.dtype
+            flash_buffers = {
+                "cache_seqlens": torch.empty(num_rows, dtype=common_attn_metadata.seq_lens.dtype, device=seq_device),
+                "seqused_q": torch.empty(num_rows, dtype=cu_dtype, device=seq_device),
+                "cu_seqlens_q": torch.empty(num_rows + 1, dtype=cu_dtype, device=seq_device),
+                "block_table": torch.empty_like(self.block_table),
+            }
+            self._flash_mla_meta_buffers[num_rows] = flash_buffers
+        flash_mla_cache_seqlens = flash_buffers["cache_seqlens"]
+        flash_mla_seqused_q = flash_buffers["seqused_q"]
+        flash_mla_cu_seqlens_q = flash_buffers["cu_seqlens_q"]
+        flash_mla_block_table = flash_buffers["block_table"]
+        flash_mla_cache_seqlens[: self.num_decodes].copy_(common_attn_metadata.seq_lens[: self.num_decodes])
+        flash_mla_seqused_q[: self.num_decodes].copy_(
+            common_attn_metadata.query_start_loc[1 : self.num_decodes + 1]
+            - common_attn_metadata.query_start_loc[: self.num_decodes]
+        )
+        flash_mla_cu_seqlens_q[: self.num_decodes + 1].copy_(
+            common_attn_metadata.query_start_loc[: self.num_decodes + 1]
+        )
+        flash_mla_block_table.copy_(self.block_table)
+        flash_mla_pad_size = num_rows - self.num_decodes
+        if flash_mla_pad_size > 0:
+            # Give the dummy rows a benign one-token / one-block request so
+            # the padded batch keeps the per-request token layout the
+            # captured graph was built with; their outputs are discarded.
+            # The cu extension stays monotonic without a host sync.
+            flash_mla_cache_seqlens[self.num_decodes :].fill_(1)
+            flash_mla_seqused_q[self.num_decodes :].fill_(1)
+            flash_mla_cu_seqlens_q[self.num_decodes + 1 :].copy_(
+                flash_mla_cu_seqlens_q[self.num_decodes : self.num_decodes + 1]
+                + torch.arange(
+                    1,
+                    flash_mla_pad_size + 1,
+                    dtype=flash_mla_cu_seqlens_q.dtype,
+                    device=seq_device,
+                )
+            )
+            flash_mla_block_table[self.num_decodes :].zero_()
         decode_metadata = self.decode_metadata_cls(
             input_positions=input_positions,
             block_table=self.block_table,
             seq_lens=self.seq_lens,
             seq_lens_list=seq_lens_list,
             max_seq_lens=max_seq_lens,
+            max_query_len=max_query_len,
             attn_mask=self.attn_mask_builder.get_splitfuse_attn_mask(),
             actual_seq_lengths_q=actual_seq_lengths_q,
             sin=sin,
             cos=cos,
+            flash_mla_cache_seqlens=flash_mla_cache_seqlens,
+            flash_mla_seqused_q=flash_mla_seqused_q,
+            flash_mla_cu_seqlens_q=flash_mla_cu_seqlens_q,
+            flash_mla_block_table=flash_mla_block_table,
+            flash_mla_metadata_stream=self.flash_mla_metadata_stream,
+            flash_mla_metadata_start=self.flash_mla_metadata_start,
+            flash_mla_metadata_ready=self.flash_mla_metadata_ready,
+            flash_mla_metadata_async=self.flash_mla_metadata_stream is not None,
         )
         return decode_metadata
 
@@ -812,6 +938,55 @@ class PrefillMLAPreprocessResult(NamedTuple):
 
 
 class AscendMLAImpl(MLAAttentionImpl):
+    @staticmethod
+    def _is_quantized_mla_projection(projection) -> bool:
+        quant_method = getattr(projection, "quant_method", None)
+        return quant_method is not None and not isinstance(quant_method, UnquantizedLinearMethod)
+
+    def start_flash_mla_metadata(self, attn_metadata: M) -> None:
+        """Launch FlashMLA metadata before the model layer loop continues."""
+        decode_meta = attn_metadata.decode
+        if decode_meta is None or decode_meta.flash_mla_metadata is not None:
+            return
+        cache_seqlens = decode_meta.flash_mla_cache_seqlens
+        cu_seqlens_q = decode_meta.flash_mla_cu_seqlens_q
+        seqused_q = decode_meta.flash_mla_seqused_q
+        if cache_seqlens is None or cu_seqlens_q is None:
+            return
+        q_len = decode_meta.max_query_len
+        num_heads_q = self.flash_quant_total_heads if self.flash_quant_mode == "W8A8C8" else self.num_heads
+        head_dim_qk = self.kv_lora_rank + self.qk_rope_head_dim
+
+        def build_metadata():
+            kwargs = dict(
+                cache_seqlens=cache_seqlens,
+                num_heads_q=num_heads_q,
+                cu_seqlens_q=cu_seqlens_q,
+                q_len=q_len,
+                head_dim_qk=head_dim_qk,
+                head_dim_v=self.kv_lora_rank,
+                mask_mode=0 if q_len == 1 else 3,
+            )
+            if self.flash_quant_mode == "W8A8C8":
+                return quant_flash_mla_metadata(seqused_q=seqused_q, **kwargs)
+            return flash_mla_metadata(seqused_q=seqused_q, **kwargs)
+
+        stream = decode_meta.flash_mla_metadata_stream
+        if stream is None:
+            decode_meta.flash_mla_metadata = build_metadata()
+            return
+        main_stream = torch.npu.current_stream()
+        decode_meta.flash_mla_metadata_start.record(main_stream)
+        stream.wait_event(decode_meta.flash_mla_metadata_start)
+        with torch.npu.stream(stream):
+            decode_meta.flash_mla_metadata = build_metadata()
+            decode_meta.flash_mla_metadata_ready.record()
+
+    def wait_flash_mla_metadata(self, attn_metadata: M) -> None:
+        decode_meta = attn_metadata.decode
+        if decode_meta is not None and decode_meta.flash_mla_metadata_async:
+            torch.npu.current_stream().wait_event(decode_meta.flash_mla_metadata_ready)
+
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -883,6 +1058,27 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
+        self.is_quantized_mla_projection = self._is_quantized_mla_projection(self.fused_qkv_a_proj)
+        # Minimal bring-up gating: K3's no-RoPE MLA layers with the fused
+        # Q/KV down projection take the prolog+FlashMLA decode path. Run with
+        # --enforce-eager; graph capture and other safety gating are not part
+        # of this verification cut.
+        self.enable_flash_mla = (
+              envs_ascend.VLLM_ASCEND_ENABLE_FLASH_MLA
+              and not self.is_draft_model
+              and not self.fa_quant_layer
+              and not self.use_mla_rope
+              and self.q_lora_rank is not None
+              and self.fused_qkv_a_proj is not None
+          )
+        if self.enable_flash_mla and not self.is_quantized_mla_projection:
+            # Fail fast with the loader's actionable message when the optional
+            # cann_ops_transformer install is missing.
+            _get_k3_flash_mla_ops()
+            _get_bf16_mla_prolog_op()
+        # Set in process_weights_after_loading once the layer's quant method
+        # is known: None for BF16, "W8A8C8" for the quantized prolog path.
+        self.flash_quant_mode = None
 
     @staticmethod
     def update_graph_params(
@@ -1100,11 +1296,206 @@ class AscendMLAImpl(MLAAttentionImpl):
                     "floating-point weights on A5. Some layers use an "
                     "unsupported weight type, so MLAPO is disabled for these layers."
                 )
-        if self.enable_mlapo or self.fa_quant_layer:
-            self._process_weights_for_fused(act_dtype)
+        if self.enable_mlapo or self.fa_quant_layer or self.enable_flash_mla:
+            if self.enable_flash_mla:
+                inner = getattr(self.fused_qkv_a_proj.quant_method, "quant_method", self.fused_qkv_a_proj.quant_method)
+                if isinstance(inner, AscendW8A8MXFP8DynamicLinearMethod):
+                    self.flash_quant_mode = "W8A8C8"
+                    logger.info(
+                        "[FlashMLA] layer=%s quant_mode=W8A8C8 (MXFP8 projections detected)",
+                        self.layer_name,
+                    )
+                    self._prepare_flash_mla_quant_weights()
+                elif isinstance(self.fused_qkv_a_proj.quant_method, UnquantizedLinearMethod):
+                    self.flash_quant_mode = None
+                    logger.info(
+                        "[FlashMLA] layer=%s quant_mode=BF16 (unquantized projections detected)",
+                        self.layer_name,
+                    )
+                    self._mlapo_uses_native_weights = True
+                    self._process_weights_for_fused(act_dtype)
+                    # mla_prolog_bf16 validates both RMSNorm weights as fp32.
+                    self.flash_gamma_qa = self.q_a_layernorm.weight.data.float().contiguous()
+                    self.flash_gamma_kva = self.kv_a_layernorm.weight.data.float().contiguous()
+                    self._prepare_flash_mla_bf16_weights()
+                else:
+                    raise RuntimeError(
+                        f"FlashMLA prolog does not support quant method "
+                        f"{type(inner).__name__}; use BF16 or W8A8_MXFP8 MLA projections."
+                    )
+            else:
+                self._process_weights_for_fused(act_dtype)
         else:
             # if mlapo, W_UK_T can't trans nz
             self.W_UK_T = maybe_trans_nz(self.W_UK_T)
+
+    def _prepare_flash_mla_quant_weights(self) -> None:
+        """Prepare W8A8C8 prolog weights from the quantized vllm-ascend linears.
+
+        The quantized prolog operator validates the full model head count
+        (e.g., 96 for Kimi K3) because the reference deploys request-DP with
+        all heads per rank.  All-gather the TP-sharded q_b projection and
+        W_UK absorption to full-head tensors for the prolog call; the decode
+        forward slices the prolog output back to this rank's local heads.
+        """
+        assert self.fused_qkv_a_proj is not None
+        _get_quant_mla_prolog_op()  # fail fast if cannbot-dsl is missing
+
+        import torch.distributed as dist
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+            get_tp_group,
+        )
+
+        hidden_size = (
+            self.config.hidden_size
+            if hasattr(self, "config")
+            else self.vllm_config.model_config.hf_text_config.hidden_size
+        )
+
+        def get_ckpt_weight(linear, input_size: int) -> torch.Tensor:
+            """Reverse the W8A8 transposition to checkpoint [O, K] orientation.
+
+            After AscendW8A8MXFP8DynamicLinearMethod.process_weights_after_loading,
+            the weight is transposed to [K, O] (input first).  Detect this by
+            checking whether dim 0 matches the linear's known input size.
+            """
+            w = linear.weight.data
+            if w.shape[0] == input_size:
+                w = w.T.contiguous()
+            return w
+
+        def get_mx_scale(linear, output: int, k: int) -> torch.Tensor:
+            s = linear.weight_scale.data
+            if s.dim() == 3:  # already [K//64, O, 2] after W8A8 transform
+                s = s.transpose(0, 1).contiguous().view(-1).reshape(output, -1)
+            return s.view(torch.uint8).reshape(output, k // 64, 2).contiguous().view(torch.float8_e8m0fnu)
+
+        # Fused Q/KV down projection: split into Q and KV parts.
+        # This is replicated (not TP-sharded) so no gather is needed.
+        fused_w = get_ckpt_weight(self.fused_qkv_a_proj, hidden_size)  # [q_lora+kv+rope, hidden]
+        self.flash_quant_w_qa = pack_mxfp8_nz(fused_w[: self.q_lora_rank].contiguous())
+        self.flash_quant_w_kva = pack_mxfp8_nz(fused_w[self.q_lora_rank :].contiguous())
+
+        fused_s = self.fused_qkv_a_proj.weight_scale.data
+        if fused_s.dim() == 3:
+            fused_s = fused_s.transpose(0, 1).contiguous().view(-1).reshape(fused_w.shape[0], -1)
+        fused_s = fused_s.view(torch.uint8)
+        q_lora = self.q_lora_rank
+        hidden = fused_w.shape[1]
+        self.flash_quant_s_qa = (
+            fused_s[:q_lora].reshape(q_lora, hidden // 64, 2).contiguous().view(torch.float8_e8m0fnu)
+        )
+        self.flash_quant_s_kva = (
+            fused_s[q_lora:].reshape(fused_w.shape[0] - q_lora, hidden // 64, 2).contiguous().view(torch.float8_e8m0fnu)
+        )
+
+        # Q up-projection (q_b_proj): all-gather the TP shards into the full
+        # head count expected by the quantized prolog operator.  The vLLM
+        # all_gather's dim parameter may not be honoured by the NPU backend,
+        # so use the explicit list-based torch.distributed.all_gather and
+        # concatenate along dim 0 manually.
+        tp_size = get_tensor_model_parallel_world_size()
+        local_heads = self.num_heads  # this rank's share (e.g., 12 with TP8)
+        total_heads = local_heads * tp_size  # e.g., 96
+
+        def gather_cat_dim0(local: torch.Tensor) -> torch.Tensor:
+            if tp_size == 1:
+                return local
+            shards = [torch.empty_like(local) for _ in range(tp_size)]
+            dist.all_gather(shards, local, group=get_tp_group().device_group)
+            return torch.cat(shards, dim=0).contiguous()
+
+        qb_w_local = get_ckpt_weight(self.q_proj, self.q_lora_rank)  # [local_heads*qk_dim, q_lora]
+        qb_w_full = gather_cat_dim0(qb_w_local)
+        self.flash_quant_w_qb = pack_mxfp8_nz(qb_w_full)
+        self.flash_quant_total_heads = total_heads
+        self.flash_quant_local_head_start = local_heads * (get_tensor_model_parallel_rank() if tp_size > 1 else 0)
+
+        # Scale for q_b: gather along the head dimension.  The e8m0fnu dtype
+        # is not supported by HCCL collectives, so communicate as raw uint8
+        # bytes (same 1-byte layout) and view back afterwards.
+        qb_s_local = get_mx_scale(self.q_proj, qb_w_local.shape[0], qb_w_local.shape[1])
+        if tp_size > 1:
+            qb_s_bytes = qb_s_local.view(torch.uint8)
+            qb_s_full = gather_cat_dim0(qb_s_bytes).view(torch.float8_e8m0fnu)
+        else:
+            qb_s_full = qb_s_local
+        self.flash_quant_s_qb = qb_s_full
+
+        # W_UK absorption: all-gather from [local_heads, qk_nope, kv_lora]
+        # to the full [total_heads, qk_nope, kv_lora] the operator expects.
+        wuk_local = self.W_UK_T  # [local_heads, qk_nope, kv_lora]
+        wuk_full = gather_cat_dim0(wuk_local)
+        self.flash_quant_w_uk = wuk_full
+
+        # Norm weights in FP32, and the per-tensor KV cache scale. The scale
+        # defaults to 1.0 (reference parity) and can be overridden through
+        # VLLM_ASCEND_FLASH_MLA_KV_SCALE with a calibrated value; the write
+        # path divides by it and every read path multiplies it back.
+        self.flash_quant_gamma_qa = self.q_a_layernorm.weight.data.float().contiguous()
+        self.flash_quant_gamma_kva = self.kv_a_layernorm.weight.data.float().contiguous()
+        self.flash_quant_kv_scale = torch.tensor(
+            [envs_ascend.VLLM_ASCEND_FLASH_MLA_KV_SCALE],
+            dtype=torch.float32,
+            device=qb_w_full.device,
+        )
+
+        logger.info(
+            "[FlashMLA][W8A8C8] layer=%s quant weights prepared: "
+            "wqb=[%d,%d] wuk=[%d,%d,%d] local_heads=%d total_heads=%d",
+            self.layer_name,
+            self.flash_quant_w_qb.shape[0],
+            self.flash_quant_w_qb.shape[1] if self.flash_quant_w_qb.dim() > 1 else 0,
+            self.flash_quant_w_uk.shape[0],
+            self.flash_quant_w_uk.shape[1],
+            self.flash_quant_w_uk.shape[2],
+            local_heads,
+            total_heads,
+        )
+
+    def _prepare_flash_mla_bf16_weights(self) -> None:
+        """Gather the full-head weights the BF16 prolog validates.
+
+        ``mla_prolog_bf16`` checks the full model head count (96 for Kimi K3)
+        even under TP, so all-gather the TP-sharded q_b projection and W_UK
+        absorption. The decode slices this rank's heads off the prolog output
+        before FlashMLA, which supports the local head count.
+        """
+        import torch.distributed as dist
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+            get_tp_group,
+        )
+
+        tp_size = get_tensor_model_parallel_world_size()
+        local_heads = self.num_heads
+        total_heads = local_heads * tp_size
+
+        def gather_cat_dim0(local: torch.Tensor) -> torch.Tensor:
+            if tp_size == 1:
+                return local
+            shards = [torch.empty_like(local) for _ in range(tp_size)]
+            dist.all_gather(shards, local, group=get_tp_group().device_group)
+            return torch.cat(shards, dim=0).contiguous()
+
+        # q_b_proj is checkpoint-oriented [local_heads * qk_head_dim, q_lora];
+        # the prolog consumes [q_lora, total_heads * qk_head_dim] in NZ.
+        qb_full = gather_cat_dim0(self.q_proj.weight.data)
+        flash_uq_qr = qb_full.T.contiguous()
+        self.flash_weight_uq_qr = torch_npu.npu_format_cast(flash_uq_qr, ACL_FORMAT_FRACTAL_NZ)
+        self.flash_weight_uk = gather_cat_dim0(self.W_UK_T)
+        self.flash_total_heads = total_heads
+        self.flash_local_head_start = local_heads * get_tensor_model_parallel_rank()
+
+        logger.info(
+            "[FlashMLA] layer=%s BF16 weights prepared: total_heads=%d local_heads=%d",
+            self.layer_name,
+            total_heads,
+            local_heads,
+        )
 
     def _load_fa_quant_scales(self):
         layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
@@ -1205,6 +1596,130 @@ class AscendMLAImpl(MLAAttentionImpl):
         toks: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return kv_c_normed, k_pe
+
+    def _forward_prefill_flash(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMLAMetadata,
+    ) -> torch.Tensor:
+        """Prefill flash-MLA layers with one paged FIA call over the full context.
+
+        exec_kv_prefill persists the current chunk to the merged PA_NZ cache
+        before attention runs, so a single causal call over the paged cache
+        covers history and chunk together -- the reference implementation's
+        validated chunk pattern (sparse_mode=3 with a shared tril mask whose
+        nonzero entries mean masked; the operator end-aligns each request's
+        queries at its own kv). The previous split design (intra-chunk FIA v1
+        plus a history-only FIA v2 merged through LSE) passed multi-token
+        packed queries with the operator's decode signature (sparse_mode=0,
+        no mask), which computes one query per request and returns a
+        per-request LSE instead of [heads, tokens].
+        """
+        prefill_metadata = attn_metadata.prefill
+        assert prefill_metadata is not None
+        original_dtype = q_nope.dtype
+        num_tokens = q_nope.size(0)
+        merged_cache = kv_cache[0]
+        block_size = merged_cache.shape[1]
+        # FIA's TND inputs only support bfloat16.
+        if q_nope.dtype != torch.bfloat16:
+            q_nope = q_nope.to(torch.bfloat16)
+            q_pe = q_pe.to(torch.bfloat16)
+        # Gather only the blocks the block table references instead of
+        # materializing the whole pool: the full-pool copies crashed the MTE
+        # copy engine (aivec errcode 82) and exhausted device memory on large
+        # caches. The scheduler's table rows are max_model_len wide and their
+        # tail columns are stale entries pointing at freed blocks with real
+        # KV, which the paged read can touch past a request's kv length, so
+        # trim to the columns this batch can actually read and redirect the
+        # remaining per-request stale columns to a zero block inside the
+        # gather. The gather returns FIA-compatible 16-element tile views,
+        # re-tiling the FP8 cache's 32-element write layout internally.
+        max_table_cols = (prefill_metadata.max_seq_lens + block_size - 1) // block_size
+        nope_view, rope_view, remapped_block_table = merged_pa_nz_gather(
+            merged_cache,
+            self.kv_lora_rank,
+            prefill_metadata.block_table[:, :max_table_cols],
+            prefill_metadata.context_lens,
+        )
+        if nope_view.dtype == torch.float8_e4m3fn:
+            # The W8A8C8 flash path stores the merged latent in FP8 scaled
+            # by a per-tensor kv scale (write: value / scale, clamp to the
+            # E4M3 range); FIA requires BF16/FP16 key_rope (and an unscaled
+            # FP8 key would compute garbage instead of raising), so
+            # materialize the history views in BF16 and multiply the scale
+            # back. The cast is lossless and the multiply is the exact
+            # dequant, restoring the post-quantization values and matching
+            # the decode path's quantized attention precision.
+            kv_scale = self.flash_quant_kv_scale.to(torch.bfloat16)
+            nope_view = nope_view.to(torch.bfloat16) * kv_scale
+            rope_view = rope_view.to(torch.bfloat16) * kv_scale
+        q_latent = torch_npu.npu_transpose_batchmatmul(
+            q_nope,
+            self.W_UK_T,
+            bias=None,
+            scale=None,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        ).view(num_tokens, self.num_heads, self.kv_lora_rank)
+        # FIA's paged MLA mode rejects non-power-of-2 head counts (e.g. 6
+        # heads with 96/TP16), so pad the query with zero heads up to
+        # num_heads_padded and slice the real heads back out afterwards.
+        if self.head_padding > 0:
+            q_latent = F.pad(q_latent, (0, 0, 0, self.head_padding))
+            q_pe = F.pad(q_pe, (0, 0, 0, self.head_padding))
+        record_attention_compute_start()
+        # Static causal band mask: FIA v2 requires exactly a 2048x2048 mask
+        # for sparse_mode=3 (EZ0009) and end-aligns it at each request's kv,
+        # so the same upper-triangular mask (nonzero = masked) covers every
+        # request's history-plus-chunk causal structure at any context
+        # length. Query chunks must stay within 2048 tokens.
+        causal_mask = ~torch.tril(
+            torch.ones(
+                FIA_CAUSAL_MASK_SIZE,
+                FIA_CAUSAL_MASK_SIZE,
+                dtype=torch.bool,
+                device=q_nope.device,
+            )
+        )
+        # FIA v2 always returns (output, lse); the lse slot is empty unless
+        # return_softmax_lse is set.
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            q_latent,
+            nope_view,
+            nope_view,
+            query_rope=q_pe,
+            key_rope=rope_view,
+            num_query_heads=self.num_heads_padded,
+            num_key_value_heads=1,
+            softmax_scale=self.scale,
+            input_layout="TND_NTD",
+            sparse_mode=3,
+            atten_mask=causal_mask,
+            actual_seq_qlen=prefill_metadata.actual_seq_lengths_q,
+            actual_seq_kvlen=prefill_metadata.context_lens.tolist(),
+            block_table=remapped_block_table,
+            block_size=block_size,
+        )
+        # TND_NTD output is head-major; fold W_UV back per head. The padded
+        # zero heads only attend over the same latent with a zero query, so
+        # their outputs are dropped by the slice below.
+        attn_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output[: self.num_heads],
+            self.W_UV,
+            bias=None,
+            scale=None,
+            perm_x1=(0, 1, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
+        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.v_head_dim)
+        if original_dtype != torch.bfloat16:
+            attn_output = attn_output.to(original_dtype)
+        return attn_output
 
     def _compute_prefill_context(
         self,
@@ -1320,7 +1835,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
-        assert len(kv_c_and_k_pe_cache) > 1
+        # FlashMLA layers carry one merged cache; legacy layers carry two.
+        assert len(kv_c_and_k_pe_cache) >= 1
+        if len(kv_c_and_k_pe_cache) == 1:
+            return self._forward_prefill_flash(q_nope, q_pe, kv_c_and_k_pe_cache, attn_metadata)
         num_tokens = q_nope.size(0)
         prefill_meta = attn_metadata.prefill
 
@@ -1408,6 +1926,82 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         return k_pe, kv_c_normed
 
+    def _exec_kv_no_rope_merged(
+        self,
+        kv_no_split: torch.Tensor,
+        kv_cache: tuple,
+        slots: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize and write K3 MLA KV into the merged PA_NZ cache.
+
+        The merged cache stores ``ckv+kr`` interleaved in NZ tile order, so
+        the normalized latent and the raw rope segment are concatenated and
+        scattered tile-by-tile through the flattened NZ view. Fresh tensors
+        are returned for the non-paged prefill attention, mirroring
+        ``_exec_kv_no_rope``.
+        """
+        assert self.kv_a_layernorm is not None
+        assert len(kv_cache) == 1
+        merged_cache = kv_cache[0]
+        num_tokens = kv_no_split.shape[0]
+        kv_no_split = kv_no_split.view(
+            num_tokens,
+            self.num_kv_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        kv_c, k_pe = kv_no_split.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+        if num_tokens > 0 and slots.numel() > 0:
+            merged = torch.cat((kv_c_normed, k_pe), dim=-1).contiguous()
+            tile_count = merged.shape[-1] // PA_NZ_TILE
+            tile_indices = pa_nz_tile_indices(slots, merged_cache.shape[1], tile_count)
+            torch_npu.npu_scatter_nd_update_(
+                merged_cache.view(-1, PA_NZ_TILE),
+                tile_indices.view(-1, 1),
+                merged.view(-1, PA_NZ_TILE),
+            )
+        kv_c_normed = kv_c_normed.view(num_tokens, self.num_kv_heads, self.kv_lora_rank)
+        k_pe = k_pe.reshape(num_tokens, self.num_kv_heads, self.qk_rope_head_dim)
+        return k_pe, kv_c_normed
+
+    def _exec_kv_no_rope_merged_fp8(
+        self,
+        kv_no_split: torch.Tensor,
+        kv_cache: tuple,
+        slots: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize and write K3 MLA KV into the merged FP8 PA_NZ cache.
+
+        The FP8 cache uses 32-element tiles and a per-tensor divisor scale
+        (fixed at 1.0).  The normalized latent and rope segment are
+        concatenated, divided by the scale, clamped to the E4M3FN range, and
+        scattered tile-by-tile.  Fresh BF16 tensors are returned for the
+        non-paged prefill attention, mirroring the BF16 merged writer.
+        """
+        assert self.kv_a_layernorm is not None
+        assert len(kv_cache) == 1
+        merged_cache = kv_cache[0]
+        num_tokens = kv_no_split.shape[0]
+        kv_no_split = kv_no_split.view(
+            num_tokens,
+            self.num_kv_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        kv_c, k_pe = kv_no_split.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+        if num_tokens > 0 and slots.numel() > 0:
+            merged = torch.cat((kv_c_normed, k_pe), dim=-1).contiguous()
+            write_fp8_cache(merged, merged_cache, slots, self.flash_quant_kv_scale)
+        kv_c_normed = kv_c_normed.view(num_tokens, self.num_kv_heads, self.kv_lora_rank)
+        k_pe = k_pe.reshape(num_tokens, self.num_kv_heads, self.qk_rope_head_dim)
+        return k_pe, kv_c_normed
+
     def exec_kv_decode(
         self,
         kv_no_split: torch.Tensor,
@@ -1455,6 +2049,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata | None = None,
     ):
         if not self.use_mla_rope:
+            if len(kv_cache) == 1:
+                if self.flash_quant_mode == "W8A8C8":
+                    return self._exec_kv_no_rope_merged_fp8(kv_no_split, kv_cache, slots)
+                return self._exec_kv_no_rope_merged(kv_no_split, kv_cache, slots)
             return self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
 
         assert self.kv_a_layernorm is not None
@@ -1547,9 +2145,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             # output. It is set to NTD to avoid the need for a transpose
             # operation after attention.
             input_layout = "TND_NTD"
-            # TODO: If the driver is upgraded later, the contiguous function can be deleted.
             # Input shape: [num_tokens, num_heads, dim]
-            q_nope = q_nope.view(num_tokens, self.num_heads, -1).contiguous()
+            q_nope = q_nope.view(num_tokens, self.num_heads, -1)
             q_pe = q_pe.view(num_tokens, self.num_heads, -1)
             # Output shape: [num_heads, num_tokens, dim]
             attn_output_shape = (self.num_heads, num_tokens, self.kv_lora_rank)
@@ -1688,6 +2285,174 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, **common_kwargs)
 
         return self._v_up_proj(attn_output)
+
+    def _use_flash_mla_decode(self, attn_metadata: M, kv_cache: tuple[torch.Tensor]) -> bool:
+        """Whether this step's decode tokens take the merged-cache FlashMLA path.
+
+        The path stays inert until the merged 576-wide PA_NZ cache is
+        allocated for the layer (single-element ``kv_cache`` tuple); the
+        legacy two-cache layout keeps the existing decode path. The merged
+        cache has no legacy decode fallback, so mixed prefill/decode batches
+        route their decode tokens here while prefill tokens keep the regular
+        prefill pipeline. The operator chain is graph-capable; capture must not
+        change the algorithm selected for an already allocated cache layout.
+        """
+        return self.enable_flash_mla and len(kv_cache) == 1 and attn_metadata.num_decode_tokens > 0
+
+    def _forward_decode_flash(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: M,
+    ) -> torch.Tensor:
+        """Decode with the fused no-Rope prolog and FlashMLA over the merged cache.
+
+        One prolog call covers the Q/KV down projections, both RMSNorms, the
+        W_UK absorption, and the merged ``ckv+kr`` PA_NZ cache update, and
+        returns the merged query. FlashMLA then attends over the merged cache
+        and ``W_UV`` restores the per-head value space, mirroring the Kimi K3
+        reference decode path.  The W8A8C8 variant uses the quantized prolog
+        and quantized FlashMLA with an FP8 PA_NZ cache.
+        """
+        decode_meta = attn_metadata.decode
+        assert decode_meta is not None
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        merged_cache = kv_cache[0]
+        # The block table may contain graph padding rows; q_len is defined by
+        # real decode requests, not by those dummy rows.
+        q_len = decode_meta.max_query_len
+        cache_seqlens = decode_meta.flash_mla_cache_seqlens
+        assert cache_seqlens is not None
+        seqused_q = decode_meta.flash_mla_seqused_q
+        cu_seqlens_q = decode_meta.flash_mla_cu_seqlens_q
+        flash_block_table = decode_meta.flash_mla_block_table
+        assert cu_seqlens_q is not None
+        assert flash_block_table is not None
+        decode_block_size = merged_cache.shape[1]
+        if decode_meta.flash_mla_tail_metadata is None:
+            decode_meta.flash_mla_tail_metadata = prepare_partial_block_tail_metadata(
+                flash_block_table,
+                cache_seqlens,
+                decode_block_size,
+                num_requests=attn_metadata.num_decodes,
+            )
+        clear_partial_block_tail(
+            merged_cache,
+            flash_block_table,
+            cache_seqlens,
+            num_requests=attn_metadata.num_decodes,
+            tail_metadata=decode_meta.flash_mla_tail_metadata,
+        )
+        if not decode_meta.flash_mla_block_table_prepared:
+            valid_cols = (cache_seqlens.reshape(-1, 1) + decode_block_size - 1) // decode_block_size
+            stale_columns = torch.arange(flash_block_table.shape[1], device=merged_cache.device)[None, :] >= valid_cols
+            flash_block_table.masked_fill_(stale_columns, merged_cache.shape[0])
+            decode_meta.flash_mla_block_table_prepared = True
+        attn_mask = decode_meta.attn_mask if q_len > 1 else None
+        if decode_meta.flash_mla_cache_indices is None:
+            decode_meta.flash_mla_cache_indices = (
+                attn_metadata.slot_mapping[:num_decode_tokens].to(torch.int64).clamp_min(0)
+            )
+        cache_indices = decode_meta.flash_mla_cache_indices
+
+        if self.flash_quant_mode == "W8A8C8":
+            x = hidden_states[:num_decode_tokens].contiguous()
+            x_quant, x_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+            x_scale = x_scale.view(torch.uint8).reshape(x.shape[0], x.shape[-1] // 64, 2).view(torch.float8_e8m0fnu)
+            q, q_descale = quant_mla_prolog(
+                x_quant,
+                x_scale,
+                self.flash_quant_w_qa,
+                self.flash_quant_w_qb,
+                self.flash_quant_w_kva,
+                self.flash_quant_w_uk,
+                self.flash_quant_s_qa,
+                self.flash_quant_s_qb,
+                self.flash_quant_s_kva,
+                self.flash_quant_gamma_qa,
+                self.flash_quant_gamma_kva,
+                merged_cache,
+                cache_indices,
+                self.flash_quant_kv_scale,
+                norm_eps=self.q_a_layernorm.variance_epsilon,
+            )
+            # The prolog returns the full-head query. The quantized FlashMLA
+            # kernel is only validated with the full head count -- the
+            # reference implementation passes all heads into the operator and
+            # slices each rank's share off the output -- so keep the
+            # full-head q and q_descale here and slice the local heads off
+            # the attention output afterwards for W_UV. Slicing the query
+            # input instead pairs the sharded head count with the quant
+            # metadata op, a combination nothing validates.
+            q = q.view(num_decode_tokens, self.flash_quant_total_heads, -1)
+            if decode_meta.flash_mla_metadata is None:
+                self.start_flash_mla_metadata(attn_metadata)
+            self.wait_flash_mla_metadata(attn_metadata)
+            attn_output = quant_flash_mla_with_kvcache(
+                q,
+                merged_cache,
+                q_descale,
+                self.flash_quant_kv_scale,
+                flash_block_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                q_len,
+                self.scale,
+                self.kv_lora_rank,
+                metadata=decode_meta.flash_mla_metadata,
+                attn_mask=attn_mask,
+                seqused_q=seqused_q,
+            )
+            head_start = self.flash_quant_local_head_start
+            attn_output = attn_output[:, head_start : head_start + self.num_heads, :].contiguous()
+        else:
+            q, *_ = mla_prolog_no_rope(
+                hidden_states[:num_decode_tokens],
+                self.weight_dq,
+                self.flash_weight_uq_qr,
+                self.flash_weight_uk,
+                self.weight_dkv_kr,
+                self.flash_gamma_qa,
+                self.flash_gamma_kva,
+                merged_cache,
+                merged_cache.new_empty(
+                      (0, merged_cache.shape[1], merged_cache.shape[2], self.qk_rope_head_dim)
+                ),
+                cache_indices,
+                self.q_a_layernorm.variance_epsilon,
+                self.kv_a_layernorm.variance_epsilon,
+            )
+            # The prolog validates and returns the full model head count;
+            # FlashMLA then runs on this rank's shard only.
+            q = q.view(num_decode_tokens, self.flash_total_heads, -1)
+            head_start = self.flash_local_head_start
+            q = q[:, head_start : head_start + self.num_heads, :]
+            if decode_meta.flash_mla_metadata is None:
+                self.start_flash_mla_metadata(attn_metadata)
+            self.wait_flash_mla_metadata(attn_metadata)
+            attn_output = flash_mla_with_kvcache(
+                q,
+                merged_cache,
+                flash_block_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                q_len,
+                self.scale,
+                self.kv_lora_rank,
+                metadata=decode_meta.flash_mla_metadata,
+                attn_mask=attn_mask,
+                seqused_q=seqused_q,
+            )
+        attn_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output,
+            self.W_UV,
+            bias=None,
+            scale=None,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
+        return attn_output.reshape(num_decode_tokens, self.num_heads * self.v_head_dim)
 
     def reorg_decode_q(self, decode_q_nope, decode_q_pe):
         if self.mlapo_num_heads > self.num_heads:
@@ -1945,7 +2710,42 @@ class AscendMLAImpl(MLAAttentionImpl):
         can_use_decode_prolog = self.use_mla_rope or get_current_hardware_profile().supports(
             HardwareCapability.MLA_DECODE_PROLOG_WITHOUT_ROPE
         )
-        if (
+        decode_preprocess_res = None
+        prefill_preprocess_res = None
+        if self._use_flash_mla_decode(attn_metadata, kv_cache):
+            # Fused no-Rope prolog (MlaPrologV4WeightNz) plus FlashMLA over
+            # the merged 576-wide PA_NZ latent cache; kv_b_proj stays absorbed
+            # on both sides of the attention core.
+            o_proj_input[:num_decode_tokens] = self._forward_decode_flash(
+                hidden_states,
+                kv_cache,
+                attn_metadata,
+            )
+            if attn_metadata.num_prefills > 0:
+                # The merged cache has no legacy decode path, so mixed batches
+                # keep their decode tokens on the FlashMLA route above while
+                # the prefill tokens run the regular prefill pipeline. The
+                # fused down projection is computed twice on the decode slice
+                # (here and inside the prolog); accepted for the transient
+                # mixed batches produced by chunked prefill.
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c, kv_no_split = qkv_lora.split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+                q_c = self.q_a_layernorm(q_c)  # type: ignore[misc]
+                kv_no_split = kv_no_split.contiguous()
+                prefill_res = self.mla_preprocess_prefill(q_c, kv_no_split, kv_cache, attn_metadata)
+                o_proj_input[num_decode_tokens:num_actual_tokens] = self._forward_prefill(
+                    prefill_res.q_nope,
+                    prefill_res.q_pe,
+                    prefill_res.k_nope,
+                    prefill_res.k_pe,
+                    prefill_res.value,
+                    kv_cache,
+                    attn_metadata,
+                )
+        elif (
             (self.fa_quant_layer or self.enable_mlapo)
             and can_use_decode_prolog
             and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS

@@ -2773,6 +2773,24 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(ptrs, [aligned_tensor.data_ptr()])
         self.assertEqual(lengths, [tensor_size])
 
+    def test_registered_hybrid_buffer_handles_split_and_strided_storage(self):
+        alignment = 2 * 1024 * 1024
+        tensor_size = 4 * alignment
+        raw_tensors = [torch.empty(2 * alignment, dtype=torch.uint8) for _ in range(2)]
+        aligned_tensors = [tensor[(-tensor.data_ptr()) % alignment :] for tensor in raw_tensors]
+        views = [tensor[:64:2] for tensor in aligned_tensors]
+        layer_name = "model.layers.0.self_attn"
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_cache_config = types.SimpleNamespace(
+            kv_cache_tensors=[types.SimpleNamespace(size=tensor_size, shared_by=[layer_name])]
+        )
+
+        ptrs, lengths = worker._get_registered_kv_tensor_buffers({layer_name: views})
+
+        self.assertEqual(ptrs, [tensor.data_ptr() for tensor in aligned_tensors])
+        self.assertEqual(lengths, [tensor.numel() for tensor in aligned_tensors])
+        self.assertTrue(all(length >= 63 for length in lengths))
+
     def test_device_id_selection_with_physical_devices(self):
         # Test with physical devices set
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())

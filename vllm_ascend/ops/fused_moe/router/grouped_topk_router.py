@@ -7,6 +7,8 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
+from vllm_ascend.ascend_forward_context import preserve_moe_router_dtype
+
 
 class AscendGroupedTopKRouter(BaseRouter):
     def __init__(
@@ -119,7 +121,8 @@ class AscendGroupedTopKRouter(BaseRouter):
             topk_weights = topk_weights + self.e_score_correction_bias
 
         topk_weights, topk_ids = topk_weights.topk(self.top_k, dim=-1)
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        if not preserve_moe_router_dtype():
+            topk_weights = topk_weights.to(hidden_states.dtype)
 
         # Required by npu_moe_init_routing
         topk_ids = topk_ids.to(torch.int32)

@@ -283,7 +283,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts=None,
         shared_experts_input: torch.Tensor | None = None,
+        shared_expert_schedule=None,
     ) -> torch.Tensor:
+        schedule_kwargs = {} if shared_expert_schedule is None else {"shared_expert_schedule": shared_expert_schedule}
         return self.quant_method.apply(
             layer=layer,
             x=x,
@@ -291,6 +293,7 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            **schedule_kwargs,
         )
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:

@@ -1,9 +1,22 @@
-# 0.27.1rc 官方原版
+# 0.27.1rc-v1.0
 
-本分支的源码来自 vLLM Ascend 官方发布分支 `releases/v0.27.1rc`，基线提交是 `0ce124446a0f59c431da76e31ffcc53489622513`。安装环境、依赖和构建方式见上游文档。
+新版 0.27.1rc，供本仓的 EventSync 系列对照。
 
-- [安装指南](docs/source/getting_started/installation.md)
-- [上游发布分支](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.27.1rc)
-- [上游提交](https://github.com/vllm-project/vllm-ascend/commit/0ce124446a0f59c431da76e31ffcc53489622513)
+## 源码基线
 
-用于对照同版本的 Kimi 优化分支。比较源码时可运行 `git diff 0.27.1rc <目标分支> -- vllm_ascend`。
+GitCode 的 `wangtao43/vllm-ascend` 发布分支 `releases/v0.27.1rc`，提交
+`75efd5e19a35c6d33212b897ea7e96ccfea0fe7a`。
+
+## 功能
+
+该分支包含发布分支已有的 Kimi-K3 适配、共享专家分流、编译支持以及 A5 MegaMoE
+在纯预填充批次上的 DP 协调。源码与上面的发布提交一致。
+
+## 使用与验证
+
+按 [安装说明](README.zh.md) 配置配套的 vLLM、CANN、PyTorch 与 torch-npu。
+本分支的仓库依赖见 [requirements.txt](requirements.txt)。
+
+完整 vLLM 测试和 Ascend NPU 实机验证待执行。
+
+[GitCode 版本提交](https://gitcode.com/wangtao43/vllm-ascend/commit/75efd5e19a35c6d33212b897ea7e96ccfea0fe7a)

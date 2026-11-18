@@ -42,6 +42,7 @@ class MoEWeights:
     w2_scale_bias: torch.Tensor | list[torch.Tensor] | None = None
     w1_offset: torch.Tensor | None = None
     w2_offset: torch.Tensor | None = None
+    quant_type: QuantType | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +58,8 @@ class MoEFusedExpertsInput:
     activation: MoEActivation | str = MoEActivation.SILU
     need_trans: bool = False
     dynamic_eplb: bool = False
+    # Optional compatible shared-expert payload for fused MegaMoE execution.
+    shared_weights: MoEWeights | None = None
     # Optional per-layer MoE LoRA state (vllm_ascend.lora MoELoRAContext).
     # ``Any`` avoids coupling the core contracts to the LoRA module; only the
     # unquant MLP path reads it, and only when a LoRA adapter is active.
@@ -87,6 +90,7 @@ def build_fused_experts_input(
     mxfp_scale_dtype: torch.dtype | None = None,
     mxfp_per_token_scale_dtype: torch.dtype | None = None,
     mxfp_use_bf16: bool | None = None,
+    mxfp_group_size: int | None = None,
     is_per_channel_weight: bool = False,
     w1_scale: list[torch.Tensor] | torch.Tensor | None = None,
     w2_scale: list[torch.Tensor] | torch.Tensor | None = None,
@@ -94,6 +98,7 @@ def build_fused_experts_input(
     w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    shared_weights: MoEWeights | None = None,
     lora_context=None,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
@@ -122,6 +127,7 @@ def build_fused_experts_input(
         activation=activation,
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
+        shared_weights=shared_weights,
         quant=build_quant_params(
             quant_type=quant_type,
             comm_quant_mode=comm_quant_mode,
@@ -130,6 +136,7 @@ def build_fused_experts_input(
             mxfp_scale_dtype=mxfp_scale_dtype,
             mxfp_per_token_scale_dtype=mxfp_per_token_scale_dtype,
             mxfp_use_bf16=mxfp_use_bf16,
+            mxfp_group_size=mxfp_group_size,
             is_per_channel_weight=is_per_channel_weight,
         ),
         lora_context=lora_context,

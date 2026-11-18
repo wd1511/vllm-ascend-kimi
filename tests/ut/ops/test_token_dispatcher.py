@@ -40,6 +40,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (  # isort: skip
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEMxfpParams, MoEQuantParams
+from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list
 from vllm_ascend.quantization.quant_type import QuantType
 
 MXFP4_TEST_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.float16)
@@ -59,6 +60,7 @@ def build_token_dispatch_input_fixture(
     act_quant_type: torch.dtype | None = None,
     is_per_channel_weight: bool = False,
     mc2_mask: torch.Tensor | None = None,
+    prefer_expert_token_counts: bool = False,
 ) -> MoETokenDispatchInput:
     mxfp_spec = None
     if quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP):
@@ -80,6 +82,7 @@ def build_token_dispatch_input_fixture(
             mxfp=mxfp_spec,
             is_per_channel_weight=is_per_channel_weight,
         ),
+        prefer_expert_token_counts=prefer_expert_token_counts,
     )
 
 
@@ -303,6 +306,39 @@ class TestTokenDispatcherWithMC2(TestBase):
         kwargs = self.dispatcher.get_dispatch_mc2_kwargs(token_dispatch_input)
 
         self.assertEqual(kwargs["expert_token_nums_type"], EXPERT_TOKEN_NUMS_TYPE_CUMSUM)
+
+    def test_situ_dispatch_returns_expert_counts(self):
+        token_dispatch_input = build_token_dispatch_input_fixture(
+            hidden_states=torch.randn(3, 8),
+            topk_weights=torch.ones(3, 1),
+            topk_ids=torch.tensor([[0], [0], [2]]),
+            expert_map=torch.arange(3),
+            quant_type=QuantType.W4A8MXFP,
+            prefer_expert_token_counts=True,
+        )
+        expert_counts = torch.tensor([2, 0, 1], dtype=torch.int32)
+        dispatch_result = (
+            torch.randn(3, 8),
+            torch.ones(3, 1),
+            torch.zeros(3, dtype=torch.int32),
+            expert_counts,
+            torch.ones(3, dtype=torch.int32),
+            None,
+            None,
+        )
+        with patch("torch_npu.npu_moe_distribute_dispatch_v2", return_value=dispatch_result, create=True) as mock_dispatch:
+            result = self.dispatcher.token_dispatch(token_dispatch_input)
+
+        self.assertEqual(mock_dispatch.call_args.kwargs["expert_token_nums_type"], EXPERT_TOKEN_NUMS_TYPE_COUNT)
+        self.assertEqual(result.group_list_type, EXPERT_TOKEN_NUMS_TYPE_COUNT)
+        self.assertIs(result.group_list, expert_counts)
+        counts_i64 = result.group_list.to(torch.int64)
+        torch.testing.assert_close(cumsum_group_list(counts_i64.cumsum(0), 0, 1), counts_i64)
+        with (
+            patch.object(torch, "diff", side_effect=AssertionError("unexpected count conversion")),
+            patch.object(torch, "cat", side_effect=AssertionError("unexpected count concatenation")),
+        ):
+            self.assertIs(cumsum_group_list(counts_i64, result.group_list_type, 1), counts_i64)
 
     def test_get_combine_mc_kwargs_with_quant(self):
         hidden_states = torch.randn(10, 128)

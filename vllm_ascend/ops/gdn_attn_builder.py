@@ -78,6 +78,16 @@ def _treat_single_token_prefills_with_state_as_decodes(
     return common_attn_metadata.replace(is_prefilling=is_prefilling)
 
 
+def _resolve_mega_kda_enabled() -> bool:
+    """Whether additional_config.enable_mega_kda is on (defensive read)."""
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return bool(getattr(get_ascend_config(), "enable_mega_kda", False))
+    except Exception:
+        return False
+
+
 @dataclass
 class GDNChunkedPrefillMetadata:
     cu_seqlens_host: tuple[int, ...]
@@ -279,6 +289,14 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
+        # MegaKDA (reference PR #50) first-Verify tracking: per-slot verify
+        # round flags plus a graph-stable materialization buffer, only
+        # maintained while the fused decode operator is enabled.
+        self._mega_kda_enabled = _resolve_mega_kda_enabled()
+        self._mega_verified_slots: torch.Tensor | None = None
+        self._mega_first_verify = torch.empty(
+            (sequence_index_capacity,), dtype=torch.int32, device=device
+        )
 
     def _init_reorder_batch_threshold(
         self,
@@ -364,6 +382,48 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.spec_query_start_loc[: graph_batch_size + 1].zero_()
         self.num_accepted_tokens[:graph_batch_size].zero_()
         self.spec_actual_seq_lengths[: graph_batch_size + 1].zero_()
+
+    def _update_mega_first_verify(
+        self,
+        block_table_tensor: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        spec_sequence_masks: torch.Tensor | None,
+        spec_state_indices_tensor: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Track per-slot Verify rounds for the MegaKDA decode path.
+
+        Mirrors the reference PR's metadata contract: the first speculative
+        round after a (chunked) prefill reads the prefill convolution tail
+        and the recurrent checkpoint, so its conv accepted count is the full
+        query length while the recurrent count restarts at one.  Prefill
+        rows reset a request's flag; every speculative round sets it.  The
+        result is materialized into a persistent buffer so FULL-graph
+        replays observe the per-step values.
+        """
+        if not self._mega_kda_enabled:
+            return None
+        if self._mega_verified_slots is None:
+            num_blocks = int(getattr(self.kv_cache_spec, "num_blocks", 0) or 0)
+            if num_blocks <= 0:
+                return None
+            self._mega_verified_slots = torch.zeros(
+                (num_blocks,), dtype=torch.uint8, device=self._mega_first_verify.device
+            )
+        flags = self._mega_verified_slots
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        prefill_rows = query_lens > 1
+        if spec_sequence_masks is not None:
+            prefill_rows &= ~spec_sequence_masks
+        prefill_slots = block_table_tensor[:, 0][prefill_rows]
+        if prefill_slots.numel() > 0:
+            flags[prefill_slots.long()] = 0
+        if spec_state_indices_tensor is None or spec_state_indices_tensor.size(0) == 0:
+            return None
+        spec_slots = spec_state_indices_tensor[:, 0].long()
+        first_verify = (flags[spec_slots] == 0).to(torch.int32)
+        flags[spec_slots] = 1
+        self._mega_first_verify[: first_verify.numel()].copy_(first_verify)
+        return self._mega_first_verify[: first_verify.numel()]
 
     def _attach_non_spec_prefill_metadata(
         self,
@@ -478,12 +538,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         spec_sequence_masks_cpu: torch.Tensor,
         num_accepted_tokens: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
         """Advance stateful spec-width prompt chunks through live spec inputs."""
         is_prefilling = common_attn_metadata.is_prefilling
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
         if is_prefilling is None or seq_lens_cpu is None or num_accepted_tokens is None:
-            return spec_sequence_masks_cpu, num_accepted_tokens
+            return spec_sequence_masks_cpu, num_accepted_tokens, 0
 
         num_reqs = min(
             spec_sequence_masks_cpu.numel(),
@@ -501,13 +561,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         fold_indices = fold.nonzero(as_tuple=True)[0]
         if fold_indices.numel() == 0:
-            return spec_sequence_masks_cpu, num_accepted_tokens
+            return spec_sequence_masks_cpu, num_accepted_tokens, 0
 
         spec_sequence_masks_cpu = spec_sequence_masks_cpu.clone()
         spec_sequence_masks_cpu[fold_indices] = True
         num_accepted_tokens = num_accepted_tokens.clone()
         num_accepted_tokens[fold_indices.to(num_accepted_tokens.device)] = self.num_spec + 1
-        return spec_sequence_masks_cpu, num_accepted_tokens
+        return spec_sequence_masks_cpu, num_accepted_tokens, int(fold_indices.numel())
 
     def build(  # type: ignore[override]
         self,
@@ -534,6 +594,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         spec_sequence_indices: torch.Tensor | None = None
         non_spec_sequence_indices: torch.Tensor | None = None
         non_spec_conv1d_cache_indices: torch.Tensor | None = None
+        folded_prefill_rows = 0
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -556,7 +617,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # their width matches speculative decode. Keep the legacy fold
             # when decode context parallelism is disabled.
             if self.vllm_config.parallel_config.decode_context_parallel_size == 1:
-                spec_sequence_masks_cpu, num_accepted_tokens = self._fold_spec_sized_prefill_chunks_into_spec(
+                (
+                    spec_sequence_masks_cpu,
+                    num_accepted_tokens,
+                    folded_prefill_rows,
+                ) = self._fold_spec_sized_prefill_chunks_into_spec(
                     m,
                     spec_sequence_masks_cpu,
                     num_accepted_tokens,
@@ -768,6 +833,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
         )
 
+        mega_first_verify = self._update_mega_first_verify(
+            block_table_tensor,
+            query_start_loc,
+            spec_sequence_masks,
+            spec_state_indices_tensor,
+        )
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
@@ -824,6 +896,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             num_accepted_tokens = self.num_accepted_tokens[:spec_batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
+            if mega_first_verify is not None:
+                # Padded graph rows are never first-verify rounds.
+                self._mega_first_verify[num_spec_decodes:spec_batch_size].fill_(0)
+                mega_first_verify = self._mega_first_verify[:spec_batch_size]
 
         if (
             self.use_full_cuda_graph
@@ -869,6 +945,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        attn_metadata.mega_first_verify = mega_first_verify
+        # Spec-width prompt chunks folded into the spec branch are prefill
+        # work; MegaKDA must not process them (reference PR #50 never routes
+        # prefill through the fused operator).
+        attn_metadata.mega_has_folded_prefills = folded_prefill_rows > 0
         attn_metadata = self._attach_non_spec_prefill_metadata(
             attn_metadata,
             non_spec_chunked_prefill_metadata,

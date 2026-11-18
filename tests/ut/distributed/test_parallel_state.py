@@ -5,6 +5,7 @@ import pytest
 from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.parallel_state import (
+    _ATTN_REDUCE_SCATTER,
     _LMTP,
     _MC2,
     _OTP,
@@ -14,6 +15,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_lmhead_tp_group,
     get_mc2_group,
     get_otp_group,
+    get_attn_reduce_scatter_group,
     get_p_tp_group,
     init_ascend_model_parallel,
 )
@@ -69,12 +71,14 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         assert mc2_group is not None
         assert otp_group is not None
         assert lmheadtp_group is not None
+        assert get_attn_reduce_scatter_group() is not None
         assert p_tp_group is not None
 
         destroy_ascend_model_parallel()
         assert _MC2 is None
         assert _LMTP is None
         assert _OTP is None
+        assert _ATTN_REDUCE_SCATTER is None
         assert _P_TP is None
 
 

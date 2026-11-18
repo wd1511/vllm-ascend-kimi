@@ -68,6 +68,8 @@ _DEVICE_PRINT_OP_REGISTERED = False
 _CURRENT_STREAM = None
 _GLOBAL_STREAM = None
 _SHARED_EXPERTS_CALCULATION_STREAM = None
+_SHARED_EXPERTS_COMM_STREAM = None
+_ROUTER_STREAM = None
 _CP_CHUNKEDPREFILL_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
@@ -513,6 +515,34 @@ def shared_experts_calculation_stream() -> torch.npu.Stream:
         # we return the default stream.
         _SHARED_EXPERTS_CALCULATION_STREAM = torch_npu.npu.Stream()
     return _SHARED_EXPERTS_CALCULATION_STREAM
+
+
+def shared_experts_comm_stream() -> torch.npu.Stream:
+    """Dedicated stream for the shared-expert TP collectives.
+
+    Keeping the all-gather / reduce-scatter off the compute stream lets the
+    shared MLP kernels be dispatched without queueing behind an HCCL task,
+    mirroring the recipes shared_stream / shared_comm_stream split.
+    """
+    global _SHARED_EXPERTS_COMM_STREAM
+    if _SHARED_EXPERTS_COMM_STREAM is None:
+        _SHARED_EXPERTS_COMM_STREAM = torch_npu.npu.Stream()
+    return _SHARED_EXPERTS_COMM_STREAM
+
+
+def router_stream() -> torch.npu.Stream:
+    """Dedicated stream for the MoE router gate GEMM + expert selection.
+
+    Mirrors recipes' ``router_stream``: the Kimi K3 multistream front
+    (multistream_overlap_shared_expert) forks the gate GEMM and topk onto
+    this stream. Created lazily before the first ACLGraph capture and reused
+    by every MoE layer so the captured graph references a stable stream
+    object.
+    """
+    global _ROUTER_STREAM
+    if _ROUTER_STREAM is None:
+        _ROUTER_STREAM = torch_npu.npu.Stream()
+    return _ROUTER_STREAM
 
 
 def cp_chunkedprefill_comm_stream() -> torch.npu.Stream:
@@ -971,6 +1001,12 @@ def create_hccl_pg_options(group_name: str):
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     hccl_config = get_hccl_config_for_pg_options(group_name) or {}
     hccl_config["group_name"] = group_name
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if getattr(kv_transfer_config, "kv_role", None) != "kv_producer":
+        hccl_config["hccl_op_expansion_mode"] = 5
     options.hccl_config = hccl_config
     return options
 
@@ -1086,6 +1122,7 @@ def _compute_potential_max_tokens(vllm_config) -> int:
 # both the skip-allreduce decision and the o_proj static-exchange buffer sizing, so
 # neither path recomputes it.
 _potential_max_tokens: int | None = None
+_MIN_NONEMPTY_MOE_BATCH_TOKENS = 1
 
 
 def set_potential_max_tokens(vllm_config) -> None:
@@ -1107,11 +1144,11 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
 
     Skipping is applicable for all dense models and for moe models only on ranks
     that act as KV consumers. We skip the DP all-reduce when either:
-    - Both the prefill and decode communication methods are MC2 (or FUSED_MC2), or
+    - MegaMoE cannot be selected and both prefill and decode use regular MC2, or
     - Decode requires MC2 and ascend_config.scheduler_config.recompute_scheduler_enable is True.
 
     Skipping means each rank may have a different number of tokens, so MC2 needs
-    a non-zero global_bs and must NOT receive mc2_mask. CANN MegaMoe requires
+    a non-zero global_bs and must NOT receive mc2_mask. MegaMoE requires
     uniform token counts across ranks, so its FUSED_MC2 path cannot skip.
 
     Returns False when hierarchy comm is enabled because hierarchy requires
@@ -1144,17 +1181,25 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     if use_cann_megamoe(vllm_config):
         return False
 
-    def needs_mc2(n: int) -> bool:
-        return select_moe_comm_method(n, vllm_config) in {MoECommType.MC2, MoECommType.FUSED_MC2}
+    def get_comm_method(n: int):
+        return select_moe_comm_method(n, vllm_config)
 
     scheduler_config = vllm_config.scheduler_config
+    if get_comm_method(_MIN_NONEMPTY_MOE_BATCH_TOKENS) == MoECommType.FUSED_MC2:
+        return False
+
     # potential_max_tokens is read from the set/get global (computed once in init).
     # if mc2 is used in decode max potential tokens case, we can skip allreduce in decode only case.
-    decode_can_skip = needs_mc2(get_potential_max_tokens())
+    decode_comm_method = get_comm_method(get_potential_max_tokens())
     # For prefill, use the scheduler's max_num_batched_tokens for a single batch.
     # if mc2 is used in prefill max potential tokens case and prefill and decode have the same cudagraph mode,
     # we can skip allreduce in chunked prefill case.
-    prefill_must_use_mc2 = needs_mc2(scheduler_config.max_num_batched_tokens)
+    prefill_comm_method = get_comm_method(scheduler_config.max_num_batched_tokens)
+    if MoECommType.FUSED_MC2 in {decode_comm_method, prefill_comm_method}:
+        return False
+
+    decode_can_skip = decode_comm_method == MoECommType.MC2
+    prefill_must_use_mc2 = prefill_comm_method == MoECommType.MC2
     uniform_cudagraph_mode = not vllm_config.compilation_config.cudagraph_mode.separate_routine()
     chunked_prefill_can_skip = prefill_must_use_mc2 and uniform_cudagraph_mode
     return decode_can_skip and (chunked_prefill_can_skip or ascend_config.scheduler_config.recompute_scheduler_enable)

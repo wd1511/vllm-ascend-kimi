@@ -3,8 +3,10 @@ from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_world_group, init_model_parallel_group
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-# Currently, mc2 op need their own group coordinator.
+# MegaMoE and MC2 operators need dedicated group coordinators.
+_MEGA_MOE: GroupCoordinator | None = None
 _MC2: GroupCoordinator | None = None
 
 # Module specific tensor parallel groups
@@ -13,9 +15,25 @@ _OTP: GroupCoordinator | None = None
 _LMTP: GroupCoordinator | None = None
 _EMBED_TP: GroupCoordinator | None = None
 
+# Kimi attention output reduce-scatter uses a separate AIV communication
+# domain from the attention gather/all-reduce group.  The source Kimi
+# implementation registers this as ``attn_reduce_scatter_group`` (HCCL
+# expansion mode 3); keep it separate from the default TP group (mode 5).
+_ATTN_REDUCE_SCATTER: GroupCoordinator | None = None
+
 _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
+
+
+def _initialize_mega_moe_communicator(group: GroupCoordinator) -> None:
+    """Eagerly initialize the HCCL communicator required by SymmBuffer."""
+    device_group = group.device_group
+    rank_in_group = torch.distributed.get_rank(group=device_group)
+    backend = device_group._get_backend(torch.device("npu"))
+    group_name = backend.get_hccl_comm_name(rank_in_group)
+    if not group_name:
+        raise RuntimeError("Failed to initialize the MegaMoE HCCL communicator")
 
 
 def init_ascend_model_parallel(
@@ -83,8 +101,16 @@ def init_ascend_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
 
-    global _MC2
+    global _MC2, _MEGA_MOE
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+    if get_ascend_device_type() == AscendDeviceType.A5 and get_ascend_config().enable_fused_mc2 == 1:
+        _MEGA_MOE = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="mega_moe",
+        )
+        _initialize_mega_moe_communicator(_MEGA_MOE)
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
@@ -133,6 +159,31 @@ def init_ascend_model_parallel(
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
 
+    # Kimi K3 sequence-parallel attention returns a full token batch from the
+    # attention kernel and reduces/scatters it back to the owner rank.  This
+    # collective must use the AIV HCCL domain, while the regular TP group is
+    # reserved for gather/all-reduce operations.  Do not use the size-keyed
+    # cache above: reusing that coordinator would silently keep group type 5.
+    global _ATTN_REDUCE_SCATTER
+    if global_tp_size > 1:
+        # Reuse vLLM's canonical rank layout so DP/PP/PCP and external-DP
+        # launch modes keep the same attention groups as the default TP
+        # coordinator.  Each group contains the TP ranks for one replica.
+        attn_reduce_scatter_groups = []
+        for replica in all_ranks.reshape(-1, global_dp_size, global_pp_size, global_pcp_size, global_tp_size):
+            for dp_idx in range(global_dp_size):
+                for pp_idx in range(global_pp_size):
+                    for pcp_idx in range(global_pcp_size):
+                        attn_reduce_scatter_groups.append(replica[dp_idx, pp_idx, pcp_idx].tolist())
+        _ATTN_REDUCE_SCATTER = init_model_parallel_group(
+            attn_reduce_scatter_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="attn_reduce_scatter_group",
+        )
+    else:
+        _ATTN_REDUCE_SCATTER = None
+
 
 def model_parallel_initialized():
     return _MC2 is not None
@@ -141,6 +192,11 @@ def model_parallel_initialized():
 def get_mc2_group() -> GroupCoordinator:
     assert _MC2 is not None, "mc2 group is not initialized"
     return _MC2
+
+
+def get_mega_moe_group() -> GroupCoordinator:
+    assert _MEGA_MOE is not None, "MegaMoE group is not initialized"
+    return _MEGA_MOE
 
 
 def get_mlp_tp_group() -> GroupCoordinator:
@@ -163,6 +219,11 @@ def get_embed_tp_group() -> GroupCoordinator:
     return _EMBED_TP
 
 
+def get_attn_reduce_scatter_group() -> GroupCoordinator:
+    assert _ATTN_REDUCE_SCATTER is not None, "attention reduce-scatter group is not initialized"
+    return _ATTN_REDUCE_SCATTER
+
+
 def get_p_tp_group() -> GroupCoordinator:
     assert _P_TP is not None, "distributed prefill tensor parallel group is not initialized"
     return _P_TP
@@ -174,6 +235,11 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
 
 
 def destroy_ascend_model_parallel():
+    global _MEGA_MOE
+    if _MEGA_MOE:
+        _MEGA_MOE.destroy()
+    _MEGA_MOE = None
+
     global _MC2
     if _MC2:
         _MC2.destroy()
@@ -193,6 +259,11 @@ def destroy_ascend_model_parallel():
     if _EMBED_TP:
         _EMBED_TP.destroy()
     _EMBED_TP = None
+
+    global _ATTN_REDUCE_SCATTER
+    if _ATTN_REDUCE_SCATTER:
+        _ATTN_REDUCE_SCATTER.destroy()
+    _ATTN_REDUCE_SCATTER = None
 
     global _OTP
     if _OTP:

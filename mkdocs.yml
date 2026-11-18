@@ -164,13 +164,13 @@ extra:
   # release and its complete compatible stack have been published and verified;
   # do not update it for main development. Git and container tags include the
   # leading "v" and are used across tutorials.
-  vllm_version: v0.27.1
-  vllm_ascend_version: v0.27.1rc1
+  vllm_version: v0.23.0
+  vllm_ascend_version: v0.23.0
   # Stable documentation target used by the developer-preview banner.
   stable_vllm_ascend_version: v0.23.0
   # PyPI versions omit the leading "v" and are used by installation commands/tests.
-  release_vllm_ascend_version: 0.27.1rc1
-  release_vllm_version: 0.27.1
+  release_vllm_ascend_version: 0.23.0
+  release_vllm_version: 0.23.0
   # The supported Python range and the Python version inside release images differ.
   release_python_version: ">= 3.10, < 3.13"
   release_image_python_version: "3.12"
@@ -338,6 +338,7 @@ nav:
         - developer_guide/Design_Documents/balance_schedule_refactor.md
         - developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md
         - developer_guide/Design_Documents/quantization.md
+        - developer_guide/Design_Documents/kimi_k3_a5_megamoe.md
         - developer_guide/Design_Documents/npugraph_ex.md
     - Evaluation:
         - developer_guide/evaluation/index.md

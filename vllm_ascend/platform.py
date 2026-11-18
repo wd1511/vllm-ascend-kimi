@@ -942,8 +942,8 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     """Validate Ascend-specific options.
 
     Covers the scheduler extension policies (enable_balance_scheduling / short_request_first_config /
-    dyntra_lb_config / recompute_scheduler_enable). Reads from the AscendConfig singleton
-    initialized from vllm_config; env fallbacks are handled inside AscendConfig.
+    dyntra_lb_config / recompute_scheduler_enable) and the decode-only profiler switch. Reads from the
+    AscendConfig singleton initialized from vllm_config; env fallbacks are handled inside AscendConfig.
     """
     # Validate scheduler extension policies (read ascend_config.scheduler_config)
     from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
@@ -1058,6 +1058,34 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 dyntra_lb_enabled=dyntra_lb_config.enabled,
             )
             vllm_config.scheduler_config = recompute_scheduler_config
+
+    _validate_profiler_decode_only(vllm_config, ascend_config)
+
+
+def _validate_profiler_decode_only(vllm_config: VllmConfig, ascend_config) -> None:
+    if getattr(ascend_config, "profiler_decode_only", False) is not True:
+        return
+
+    profiler_config = getattr(vllm_config, "profiler_config", None)
+    if profiler_config is None or profiler_config.profiler is None:
+        logger.warning(
+            "profiler_decode_only is set but --profiler-config is not enabled on this instance; "
+            "decode-only profiling is ignored here."
+        )
+        return
+
+    if profiler_config.profiler != "torch":
+        raise ValueError("profiler_decode_only only supports profiler='torch'.")
+
+    if not getattr(profiler_config, "ignore_frontend", False):
+        logger.warning(
+            "profiler_decode_only is enabled; forcing ignore_frontend=true so the AsyncLLM frontend CPU "
+            "trace does not contain prefill/dummy request processing."
+        )
+        profiler_config.ignore_frontend = True
+
+    if getattr(ascend_config, "msmonitor_use_daemon", False) is True:
+        raise ValueError("profiler_decode_only and msmonitor_use_daemon cannot be enabled at the same time.")
 
 
 def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:

@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
+from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import (
     get_dp_group,
     get_pcp_group,
@@ -29,7 +30,11 @@ from vllm.distributed.parallel_state import (
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    get_a5_mega_moe_buffer_tokens_per_rank,
+    get_moe_sequence_parallel_size,
+)
 from vllm_ascend.lora.fused_moe import prepare_lora_indices
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -345,6 +350,51 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 input_ids = torch.tensor_split(input_ids, self.tp_size, dim=0)
                 input_ids = input_ids[self.tp_rank]
         return input_ids
+
+
+class PrepareAndFinalizeWithMegaMoE(PrepareAndFinalize):
+    """Pass each rank's local batch size directly to A5 MegaMoE."""
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE,
+    ) -> MoEPrepareOutput:
+        self.num_tokens = hidden_states.shape[0]
+        vllm_config = get_current_vllm_config()
+        if vllm_config is None:
+            raise RuntimeError("A5 MegaMoE requires a current vLLM configuration.")
+        sp_size = get_moe_sequence_parallel_size(self.moe_config)
+        buffer_tokens_per_rank = get_a5_mega_moe_buffer_tokens_per_rank(
+            vllm_config,
+            sp_size=sp_size,
+        )
+        if self.num_tokens < 1 or self.num_tokens > buffer_tokens_per_rank:
+            raise ValueError(
+                "MegaMoE input must contain 1 to buffer_tokens_per_rank tokens: "
+                f"local={self.num_tokens}, capacity={buffer_tokens_per_rank}, sp_size={sp_size}."
+            )
+
+        return MoEPrepareOutput(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            mc2_mask=None,
+            padded_hidden_states_shape=hidden_states.shape,
+            pertoken_scale=None,
+        )
+
+    def pad_and_split_input_ids(self, input_ids):
+        return input_ids
+
+    def finalize(
+        self,
+        hidden_states: torch.Tensor,
+        reduce_results: bool,
+        padded_hidden_states_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        return hidden_states[: self.num_tokens]
 
 
 class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):

@@ -119,7 +119,7 @@ class TestSwigluOaiDynamicMxQuant(unittest.TestCase):
         )
 
 
-class TestW4A8SituGmmFusion(unittest.TestCase):
+class TestW4A8GroupedSituMxQuant(unittest.TestCase):
     def _kwargs(self, *, group_list_type=1, linear_beta=25.0):
         return {
             "hidden_states": torch.ones(2, 4, dtype=torch.int8),
@@ -145,10 +145,10 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
             "mxfp_quant_dtype": QuantType.W4A8MXFP,
         }
 
-    def test_fusion_selection_matches_supported_scope(self):
+    def test_grouped_situ_selection_matches_supported_scope(self):
         with patch.object(moe_mlp_module, "ASCEND_DEVICE_TYPE", AscendDeviceType.A5):
             self.assertTrue(
-                moe_mlp_module._gmm_situ_quant_fusion_enabled(
+                moe_mlp_module._grouped_situ_mx_quant_supported(
                     True,
                     QuantType.W4A8MXFP,
                     MoEActivation.SITU,
@@ -157,7 +157,7 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
                 )
             )
             self.assertFalse(
-                moe_mlp_module._gmm_situ_quant_fusion_enabled(
+                moe_mlp_module._grouped_situ_mx_quant_supported(
                     True,
                     QuantType.W8A8MXFP,
                     MoEActivation.SITU,
@@ -166,7 +166,7 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
                 )
             )
             self.assertFalse(
-                moe_mlp_module._gmm_situ_quant_fusion_enabled(
+                moe_mlp_module._grouped_situ_mx_quant_supported(
                     True,
                     QuantType.W4A8MXFP,
                     MoEActivation.SITU,
@@ -175,7 +175,7 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
                 )
             )
             self.assertFalse(
-                moe_mlp_module._gmm_situ_quant_fusion_enabled(
+                moe_mlp_module._grouped_situ_mx_quant_supported(
                     True,
                     QuantType.W4A8MXFP,
                     MoEActivation.SITU,
@@ -185,7 +185,7 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
             )
         with patch.object(moe_mlp_module, "ASCEND_DEVICE_TYPE", AscendDeviceType.A3):
             self.assertFalse(
-                moe_mlp_module._gmm_situ_quant_fusion_enabled(
+                moe_mlp_module._grouped_situ_mx_quant_supported(
                     True,
                     QuantType.W4A8MXFP,
                     MoEActivation.SITU,
@@ -194,34 +194,34 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
                 )
             )
 
-    def test_uses_fused_gmm_situ_for_both_group_list_types(self):
-        for group_list_type, linear_beta, expected_linear_beta in ((0, None, 0.0), (1, 25.0, 25.0)):
+    def test_grouped_situ_mx_quant_uses_gmm_then_recipes_op(self):
+        for group_list_type, group_list in ((0, torch.tensor([1, 2])), (1, torch.tensor([1, 1]))):
             with self.subTest(group_list_type=group_list_type):
-                kwargs = self._kwargs(group_list_type=group_list_type, linear_beta=linear_beta)
-                normalized_scale = torch.full((2, 1), 2.0, dtype=torch.float32)
-                situ_out = torch.ones(2, 4, dtype=torch.int8)
-                situ_scale = torch.ones(2, 1, dtype=torch.float32)
+                kwargs = self._kwargs(group_list_type=group_list_type)
+                kwargs["group_list"] = group_list
+                gate_up_out = torch.ones(2, 8, dtype=torch.bfloat16)
+                situ_out = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+                situ_scale = torch.ones(2, 1, 2, dtype=torch.float32)
                 down_out = torch.ones(2, 4, dtype=torch.bfloat16)
-                event = object()
 
                 with (
                     patch.object(moe_mlp_module, "ASCEND_DEVICE_TYPE", AscendDeviceType.A5),
                     patch(f"{MOE_MLP}._EXTRA_CTX", MagicMock(moe_comm_type=-1)),
                     patch.object(
-                        DeviceOperator,
-                        "maybe_normalize_mxfp_scale_layout",
-                        return_value=normalized_scale,
-                    ) as mock_normalize,
+                        DeviceOperator, "maybe_normalize_mxfp_scale_layout", return_value=kwargs["dynamic_scale"]
+                    ),
                     patch.object(
-                        moe_mlp_module.torch_npu,
-                        "npu_grouped_matmul",
-                        create=True,
+                        moe_mlp_module.torch_npu, "npu_grouped_matmul", return_value=[gate_up_out]
                     ) as mock_gmm1,
+                    patch.object(DeviceOperator, "npu_grouped_matmul_situ_quant") as mock_fused,
                     patch.object(
-                        DeviceOperator,
-                        "npu_grouped_matmul_situ_quant",
-                        return_value=(situ_out, situ_scale, None),
-                    ) as mock_fused,
+                        moe_mlp_module.torch.ops,
+                        "custom",
+                        SimpleNamespace(grouped_situ_mx_quant=MagicMock(return_value=(situ_out, situ_scale))),
+                    ) as custom_ops,
+                    patch.object(torch.ops._C_ascend, "situ_mx_quant", create=True) as old_situ,
+                    patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=down_out) as mock_gmm2,
+                    patch.object(moe_mlp_module, "dispose_tensor"),
                     patch.object(
                         DeviceOperator,
                         "npu_grouped_matmul_gmm2",
@@ -234,7 +234,7 @@ class TestW4A8SituGmmFusion(unittest.TestCase):
                         return_value=MagicMock(record_event=MagicMock(return_value=event)),
                     ),
                 ):
-                    output, before_gmm2_evt = quant_apply_mlp(**kwargs)
+                    output, before_gmm2_evt, _ = quant_apply_mlp(**kwargs)
 
                 self.assertIs(output, down_out)
                 self.assertIs(before_gmm2_evt, event)
@@ -281,6 +281,15 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
                         side_effect=[[gate_up_out], [expected_output]],
                         create=True,
                     ) as grouped_matmul:
+                        output, _, _ = unquant_apply_mlp(
+                    with (
+                        patch(f"{MOE_MLP}.ASCEND_DEVICE_TYPE", AscendDeviceType.A3),
+                        patch(
+                            f"{MOE_MLP}.torch_npu.npu_grouped_matmul",
+                            side_effect=[[gate_up_out], [expected_output]],
+                            create=True,
+                        ) as grouped_matmul,
+                    ):
                         output, _ = unquant_apply_mlp(
                             hidden_states=hidden_states,
                             w1=torch.randn(1, 8, 16),
@@ -294,6 +303,87 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
 
                     self.assertIs(output, expected_output)
                     torch.testing.assert_close(grouped_matmul.call_args_list[1].kwargs["x"][0], expected_activation)
+
+    def test_unquant_situ_uses_sparse_op_for_a5_routed_experts(self):
+        hidden_states = torch.ones(2, 8, dtype=torch.bfloat16)
+        gate_up_out = torch.ones(2, 16, dtype=torch.bfloat16)
+        activated = torch.ones(2, 8, dtype=torch.bfloat16)
+        expected_output = torch.ones(2, 8, dtype=torch.bfloat16)
+
+        for group_list_type, group_list in ((0, torch.tensor([1, 2])), (1, torch.tensor([1, 1]))):
+            with self.subTest(group_list_type=group_list_type):
+                sparse_situ = MagicMock(return_value=activated)
+                with (
+                    patch(f"{MOE_MLP}.ASCEND_DEVICE_TYPE", AscendDeviceType.A5),
+                    patch.object(
+                        moe_mlp_module.torch_npu,
+                        "npu_grouped_matmul",
+                        side_effect=[[gate_up_out], [expected_output]],
+                        create=True,
+                    ) as grouped_matmul,
+                    patch.object(
+                        moe_mlp_module.torch.ops,
+                        "custom",
+                        SimpleNamespace(npu_situ_and_mul_sparse=sparse_situ),
+                    ),
+                ):
+                    output, _ = unquant_apply_mlp(
+                        hidden_states=hidden_states,
+                        w1=torch.ones(2, 8, 16),
+                        w2=torch.ones(2, 8, 8),
+                        group_list=group_list,
+                        group_list_type=group_list_type,
+                        activation=MoEActivation.SITU,
+                        activation_situ_beta=4.0,
+                        activation_situ_linear_beta=25.0,
+                        need_trans=False,
+                    )
+
+                self.assertIs(output, expected_output)
+                sparse_situ.assert_called_once()
+                sparse_input, expert_counts = sparse_situ.call_args.args
+                self.assertIs(sparse_input, gate_up_out)
+                torch.testing.assert_close(expert_counts, torch.tensor([1, 1]))
+                self.assertEqual(
+                    sparse_situ.call_args.kwargs,
+                    {"beta": 4.0, "alpha": 25.0, "high_precision": True},
+                )
+                self.assertIs(grouped_matmul.call_args_list[1].kwargs["x"][0], activated)
+
+    def test_unquant_situ_without_linear_beta_keeps_native_path_on_a5(self):
+        hidden_states = torch.ones(2, 8, dtype=torch.bfloat16)
+        gate_up_out = torch.ones(2, 16, dtype=torch.bfloat16)
+        activated = torch.ones(2, 8, dtype=torch.bfloat16)
+        sparse_situ = MagicMock(side_effect=AssertionError("sparse SiTU requires positive linear_beta"))
+
+        with (
+            patch(f"{MOE_MLP}.ASCEND_DEVICE_TYPE", AscendDeviceType.A5),
+            patch.object(
+                moe_mlp_module.torch_npu,
+                "npu_grouped_matmul",
+                side_effect=[[gate_up_out], [hidden_states]],
+                create=True,
+            ),
+            patch.object(moe_mlp_module, "_apply_situ", return_value=activated) as native_situ,
+            patch.object(
+                moe_mlp_module.torch.ops,
+                "custom",
+                SimpleNamespace(npu_situ_and_mul_sparse=sparse_situ),
+            ),
+        ):
+            unquant_apply_mlp(
+                hidden_states=hidden_states,
+                w1=torch.ones(2, 8, 16),
+                w2=torch.ones(2, 8, 8),
+                group_list=torch.tensor([1, 1]),
+                activation=MoEActivation.SITU,
+                activation_situ_beta=4.0,
+                activation_situ_linear_beta=None,
+                need_trans=False,
+            )
+
+        native_situ.assert_called_once_with(gate_up_out, beta=4.0, linear_beta=None)
+        sparse_situ.assert_not_called()
 
     def test_unquant_swigluoai_uninterleave_falls_back_on_a5(self):
         hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
@@ -321,7 +411,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
             ) as mock_grouped_matmul,
             patch("torch_npu.npu_clipped_swiglu", create=True) as mock_clipped_swiglu,
         ):
-            output, _ = unquant_apply_mlp(
+            output, _, _ = unquant_apply_mlp(
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
@@ -357,7 +447,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
                 create=True,
             ),
         ):
-            output, _ = unquant_apply_mlp(
+            output, _, _ = unquant_apply_mlp(
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
@@ -758,7 +848,7 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
             patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=expected) as mock_gmm2,
             patch(f"{MOE_MLP}.dispose_tensor"),
         ):
-            output, before_gmm2_evt = quant_apply_mlp(
+            output, before_gmm2_evt, _ = quant_apply_mlp(
                 hidden_states=hidden_states,
                 w1=w1,
                 w1_scale=w1_scale,
@@ -788,6 +878,7 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
     def test_w4a8_mxfp_situ_uses_common_input_quant_and_gmm2(self):
         quantized_input = torch.randn(1, 4)
         input_scale = torch.ones(1, 1)
+        gate_up_out = torch.ones(1, 8, dtype=torch.bfloat16)
         quantized_situ_out = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
         situ_out_scale = torch.ones(2, 1)
         expected = torch.randn(2, 4, dtype=torch.bfloat16)
@@ -797,17 +888,18 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
             stream_patch,
             patch.object(moe_mlp_module, "ASCEND_DEVICE_TYPE", AscendDeviceType.A5),
             patch(f"{MOE_MLP}._EXTRA_CTX", MagicMock(moe_comm_type=-1)),
-            patch("torch_npu.npu_grouped_matmul", create=True) as mock_gmm1,
+            patch("torch_npu.npu_grouped_matmul", return_value=[gate_up_out], create=True) as mock_gmm1,
             patch.object(
                 DeviceOperator,
                 "npu_dynamic_quant",
                 return_value=(quantized_input, input_scale),
             ) as input_quant,
+            patch.object(DeviceOperator, "npu_grouped_matmul_situ_quant") as fused_situ,
             patch.object(
-                DeviceOperator,
-                "npu_grouped_matmul_situ_quant",
-                return_value=(quantized_situ_out, situ_out_scale, None),
-            ) as fused_situ,
+                moe_mlp_module.torch.ops,
+                "custom",
+                SimpleNamespace(grouped_situ_mx_quant=MagicMock(return_value=(quantized_situ_out, situ_out_scale))),
+            ) as custom_ops,
             patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=expected) as mock_gmm2,
             patch(f"{MOE_MLP}.dispose_tensor") as mock_dispose,
         ):
@@ -819,7 +911,7 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
                 use_mxfp_quant=True,
                 mxfp_quant_dtype=QuantType.W4A8MXFP,
             )
-            output, before_gmm2_evt = quant_apply_mlp(**kwargs)
+            output, before_gmm2_evt, _ = quant_apply_mlp(**kwargs)
 
         self.assertIs(output, expected)
         self.assertIs(before_gmm2_evt, evt)
@@ -829,12 +921,16 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
             act_quant_type=torch.int8,
             use_mxfp_quant=True,
         )
-        self.assertIs(fused_situ.call_args.kwargs["x"], quantized_input)
-        self.assertIs(fused_situ.call_args.kwargs["x_scale"], input_scale)
-        self.assertEqual(fused_situ.call_args.kwargs["beta"], 4.0)
-        self.assertEqual(fused_situ.call_args.kwargs["linear_beta"], 25.0)
+        self.assertIs(mock_gmm1.call_args.kwargs["x"][0], quantized_input)
+        self.assertIs(mock_gmm1.call_args.kwargs["per_token_scale"][0], input_scale)
+        custom_ops.grouped_situ_mx_quant.assert_called_once()
+        self.assertIs(custom_ops.grouped_situ_mx_quant.call_args.args[0], gate_up_out)
+        self.assertEqual(
+            custom_ops.grouped_situ_mx_quant.call_args.kwargs,
+            {"beta": 4.0, "alpha": 25.0, "high_precision": False},
+        )
         self.assertIs(mock_gmm2.call_args.kwargs["per_token_scale"], situ_out_scale)
-        mock_gmm1.assert_not_called()
+        fused_situ.assert_not_called()
         mock_dispose.assert_called_once_with(kwargs["hidden_states"])
 
     def test_antiquant_weights_use_native_situ_between_grouped_matmuls(self):
@@ -864,7 +960,7 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
                 w1_offset=torch.randn(1, 8, 4),
                 w2_offset=torch.randn(1, 4, 1),
             )
-            output, before_gmm2_evt = quant_apply_mlp(**kwargs)
+            output, before_gmm2_evt, _ = quant_apply_mlp(**kwargs)
 
         self.assertIs(output, expected)
         self.assertIs(before_gmm2_evt, evt)
@@ -898,7 +994,7 @@ class TestQuantApplyMlpSituEplb(_GeluPathBase):
                 use_mxfp_quant=True,
                 mxfp_quant_dtype=QuantType.W4A16MXFP,
             )
-            output, before_gmm2_evt = quant_apply_mlp(**kwargs)
+            output, before_gmm2_evt, _ = quant_apply_mlp(**kwargs)
 
         self.assertIs(output, expected)
         self.assertIs(before_gmm2_evt, evt)
@@ -947,7 +1043,7 @@ class TestQuantApplyMlpMxfpSwigluOAI(_GeluPathBase):
                     patch(f"{MOE_MLP}.torch_npu.npu_clipped_swiglu", create=True) as mock_clipped_swiglu,
                     patch(f"{MOE_MLP}.dispose_tensor"),
                 ):
-                    output, output_evt = quant_apply_mlp(**kwargs)
+                    output, output_evt, _ = quant_apply_mlp(**kwargs)
 
                 self.assertIs(output, expected)
                 self.assertIs(output_evt, evt)
@@ -999,7 +1095,7 @@ class TestQuantApplyMlpGeluPath(_GeluPathBase):
         expected = F.gelu(gate, approximate="tanh") * up
         gmm2_out = torch.tensor([[9.0]])
         with _mock_w8a8_gelu_compute(gate_up, gmm2_out=gmm2_out, capture_quant=True) as m:
-            out, out_evt = quant_apply_mlp(**self._common_w8a8_kwargs(activation=MoEActivation.GELU_TANH))
+            out, out_evt, _ = quant_apply_mlp(**self._common_w8a8_kwargs(activation=MoEActivation.GELU_TANH))
         # GELU math applied with tanh approximation before requantization.
         self.assertTrue(torch.allclose(m.captured["x"], expected, atol=1e-6))
         # GMM1 used the dequant form (scale + per_token_scale), not antiquant.
@@ -1012,7 +1108,7 @@ class TestQuantApplyMlpGeluPath(_GeluPathBase):
         m.dq.assert_called_once()
         m.gmm2.assert_called_once()
         self.assertIs(m.gmm2.call_args.kwargs["per_token_scale"], m.captured["scale"])
-        # Return contract: (hidden_states, before_gmm2_evt).
+        # Return contract: (hidden_states, before_gmm2_evt, after_gmm1_evt).
         self.assertIs(out, gmm2_out)
         self.assertIs(out_evt, m.evt)
 
@@ -1049,7 +1145,7 @@ class TestQuantApplyMlpGeluPath(_GeluPathBase):
             # Switch to the W4A16 antiquant layout.
             kwargs["w1_offset"] = torch.randn(1, 8, 4)
             kwargs["w2_offset"] = torch.randn(1, 4, 1)
-            out, out_evt = quant_apply_mlp(**kwargs)
+            out, out_evt, _ = quant_apply_mlp(**kwargs)
 
         self.assertEqual(mock_gmm.call_count, 2)
         # Both GMM calls use antiquant (not scale/per_token_scale).
@@ -1210,7 +1306,7 @@ class TestQuantApplyMlpGeluPath(_GeluPathBase):
             patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=expected),
             patch(f"{MOE_MLP}.dispose_tensor"),
         ):
-            out, _ = quant_apply_mlp(**kwargs)
+            out, _, _ = quant_apply_mlp(**kwargs)
 
         weight_scale = mock_dequant_swiglu.call_args.kwargs["weight_scale"]
         self.assertEqual(weight_scale.shape, torch.Size([2, 8]))
@@ -1248,7 +1344,7 @@ class TestQuantApplyMlpGeluPath(_GeluPathBase):
             patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=expected),
             patch(f"{MOE_MLP}.dispose_tensor"),
         ):
-            out, _ = quant_apply_mlp(**kwargs)
+            out, _, _ = quant_apply_mlp(**kwargs)
 
         packed_scale = mock_dequant_swiglu.call_args.kwargs["weight_scale"]
         self.assertEqual(packed_scale.shape, torch.Size([3, 4]))

@@ -160,6 +160,17 @@ def npugraph_ex_compile(
     try:
         import npugraph_ex as nge
 
+        if ascend_compilation_config.enable_static_kernel:
+            from npugraph_ex._acl_concrete_graph.static_kernel import _set_static_kernel_blacklist
+
+            # Use the CANN op type, including when invoked through the FIA v2 API.
+            # Keep FIA on its dynamic kernel while other ops compile statically.
+            _set_static_kernel_blacklist(["FusedInferAttentionScore"])
+            logger.info_once(
+                "Skipping static kernel compilation for FusedInferAttentionScore.",
+                scope="global",
+            )
+
         cache_path = os.path.join(cache_dir, key) if (cache_dir and key) else None
         torch.npu.set_compile_mode(jit_compile=False)
         config = nge.CompilerConfig()

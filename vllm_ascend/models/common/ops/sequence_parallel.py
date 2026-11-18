@@ -9,6 +9,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm_ascend.distributed.parallel_state import get_attn_reduce_scatter_group
 
 
 def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
@@ -26,16 +27,31 @@ def sp_all_gather(x: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0)
 
 
-def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+def sp_reduce_scatter(x: torch.Tensor, *, use_attn_group: bool = False) -> torch.Tensor:
     assert x.ndim == 2
     tp_size = get_tensor_model_parallel_world_size()
     sp_pad = (-x.shape[0]) % tp_size
-    pad_shape = [sp_pad, x.shape[1]]
-    x = torch.cat([x, x.new_zeros(pad_shape)], dim=0)
+    if sp_pad:
+        pad_shape = [sp_pad, x.shape[1]]
+        x = torch.cat([x, x.new_zeros(pad_shape)], dim=0)
+    # Kimi K3 attention output uses a dedicated AIV HCCL group.  Dense MLP
+    # and MoE sequence-parallel reductions must keep the regular TP group.
+    if use_attn_group:
+        try:
+            attn_group = get_attn_reduce_scatter_group()
+        except AssertionError:
+            attn_group = None
+        if attn_group is not None:
+            return attn_group.reduce_scatter(x, 0)
     output = _custom_collective("custom_reduce_scatter", x)
     if output is not None:
         return output
     return tensor_model_parallel_reduce_scatter(x, 0)
+
+
+def sp_attn_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+    """Reduce-scatter Kimi attention output through the AIV TP group."""
+    return sp_reduce_scatter(x, use_attn_group=True)
 
 
 def sp_shard(x: torch.Tensor) -> torch.Tensor:

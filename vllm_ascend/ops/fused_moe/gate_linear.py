@@ -61,3 +61,40 @@ class AscendGateLinear(GateLinear):
         output, output_bias = ReplicatedLinear.forward(self, x)
 
         return output, output_bias
+
+
+class AscendKimiGateLinear(GateLinear):
+    """Kimi-K3 router gate matching the recipes BF16 router GEMM.
+
+    The recipes baseline computes ``torch.mm(x, weight.t(), out_dtype=fp32)``
+    directly from the BF16 RMSNorm output. Keep the same data path here so the
+    router GEMM does not materialize an FP32 copy of the activations, while the
+    router logits stay FP32 for ``npu_moe_gating_top_k``.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        out_dtype: torch.dtype | None = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            params_dtype=torch.bfloat16,
+            out_dtype=out_dtype,
+            force_fp32_compute=False,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        if x.device.type != "npu":
+            # CPU paths (unit tests) emulate the NPU op's FP32 accumulation
+            # without torch_npu's ``out_dtype`` extension.
+            return torch.mm(x.float(), self.weight.t().float()), None
+        if x.dtype != self.weight.dtype:
+            return super().forward(x)
+        return torch.mm(x, self.weight.t(), out_dtype=torch.float32), None

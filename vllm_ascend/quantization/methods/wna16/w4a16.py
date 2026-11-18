@@ -23,7 +23,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, preserve_moe_router_dtype
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
 
@@ -256,7 +256,8 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
+        if not preserve_moe_router_dtype():
+            topk_weights = topk_weights.to(x.dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         return moe_comm_method.fused_experts(

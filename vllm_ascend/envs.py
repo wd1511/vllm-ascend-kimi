@@ -71,6 +71,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable the `fused` AttnRes backend for Kimi K3 (CANNBot DSL
+    # kernels when `cannbot_dsl` is installed; pure-Torch `two_phase` as the
+    # fallback). Disabling this env var keeps the previous `two_phase` backend
+    # even when CANNBot DSL operators are available.
+    "VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_K3_ATTNRES_FUSED_ENABLED", "1"))
+    ),
+    # Whether to enable the experimental Kimi K3 W8A8C8 MLA prolog + FlashMLA
+    # decode path. The default is disabled so quantized MLA keeps the legacy
+    # path. Unquantized no-RoPE MLA uses the BF16 fused path independently.
+    # Requires Ascend 950 (A5), a CANN 9.2 matching cann_ops_transformer
+    # install, and supported quantized MLA weights.
+    # If not set, the default value is False.
+    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASH_MLA", "0"))),
+    # Per-tensor scale of the W8A8C8 FlashMLA merged FP8 latent cache. The
+    # write path stores value / scale clamped to the E4M3 range and every read
+    # path (quantized FlashMLA decode, FIA prefill history) multiplies it
+    # back. Valid range: (0, 448]. The default 1.0 matches the reference
+    # recipe; a calibrated value (max latent magnitude / 448) only helps when
+    # real latents exceed the E4M3 range, because E4M3 is a float format
+    # whose relative precision is scale-independent. Not sensitive.
+    "VLLM_ASCEND_FLASH_MLA_KV_SCALE": lambda: float(os.getenv("VLLM_ASCEND_FLASH_MLA_KV_SCALE", "1.0")),
 }
 
 # end-env-vars-definition
