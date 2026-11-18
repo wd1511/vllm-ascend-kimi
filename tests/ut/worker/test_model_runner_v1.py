@@ -2020,7 +2020,7 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
 
 
 class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
-    """_sync_metadata_across_dp: side-stream exchange keeps unpack semantics."""
+    """The runner's priority pool preserves metadata unpack semantics."""
 
     REDUCED_UNIFORM = [[8, 16], [2, 2]]
     REDUCED_MIN_MODE = [[8, 16], [0, 2]]
@@ -2031,12 +2031,14 @@ class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
         runner.dp_rank = dp_rank
         runner.device = torch.device("cpu")
         runner.pin_memory = False
-        runner.ascend_config = SimpleNamespace(enable_fused_mc2=0)
         runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=dp_size))
-        runner._dp_metadata_stream = None
-        runner._dp_metadata_event = None
-        runner._dp_metadata_pinned = None
-        runner._dp_metadata_device = None
+        runner.ascend_config = SimpleNamespace(
+            enable_fused_mc2=0,
+            sync_optimization=SimpleNamespace(
+                stream_pool_size=2, metadata_stream_priority=-1, enable_event_query_fast_path=True
+            )
+        )
+        runner._dp_metadata_pool = None
         return runner
 
     @staticmethod
@@ -2055,7 +2057,7 @@ class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
                 return_value=False,
             ),
             patch(
-                "vllm_ascend.worker.model_runner_v1.dist.all_reduce",
+                "vllm_ascend.worker.metadata_stream_pool.dist.all_reduce",
                 side_effect=self._fake_all_reduce(reduced_rows),
             ) as all_reduce,
             patch("vllm_ascend.worker.model_runner_v1.get_dp_group") as dp_group,
@@ -2065,16 +2067,17 @@ class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
                 create=True,
             ),
             patch("torch.npu.Stream") as stream_cls,
-            patch("torch.npu.Event"),
+            patch("torch.npu.Event") as event_cls,
             patch("torch.npu.stream", return_value=nullcontext()),
         ):
             dp_group.return_value.device_group = object()
+            event_cls.return_value.query.return_value = False
             result = runner._sync_metadata_across_dp(**kwargs)
-        return result, all_reduce, stream_cls
+        return result, all_reduce, stream_cls, event_cls
 
     def test_side_stream_unpacks_reduced_metadata(self):
         runner = self._build_runner()
-        result, all_reduce, _ = self._run_side_stream(
+        result, all_reduce, _, event_cls = self._run_side_stream(
             runner,
             self.REDUCED_UNIFORM,
             num_tokens=8,
@@ -2088,7 +2091,7 @@ class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
         # The exchange ran once on the persistent device buffer and was
         # synchronized before unpacking.
         all_reduce.assert_called_once()
-        runner._dp_metadata_event.synchronize.assert_called_once_with()
+        event_cls.return_value.synchronize.assert_called_once_with()
 
     def test_side_stream_min_mode_and_per_rank_padding(self):
         runner = self._build_runner()
@@ -2102,8 +2105,15 @@ class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
         self.assertEqual(max_tokens, 16)
         self.assertEqual(synced_mode, CUDAGraphMode.NONE)
         torch.testing.assert_close(padding, torch.tensor([8, 16], dtype=torch.int32))
-        # The returned per-rank padding must not alias the reused pinned buffer.
-        self.assertNotEqual(padding.data_ptr(), runner._dp_metadata_pinned.data_ptr())
+        # Preserve the returned view across another exchange on the same lane.
+        self._run_side_stream(
+            runner,
+            self.REDUCED_UNIFORM,
+            num_tokens=8,
+            cudagraph_mode=CUDAGraphMode.FULL,
+            allow_dp_padding=False,
+        )
+        torch.testing.assert_close(padding, torch.tensor([8, 16], dtype=torch.int32))
 
     def test_side_stream_buffers_are_reused_across_calls(self):
         runner = self._build_runner()
@@ -2114,7 +2124,7 @@ class TestSyncMetadataAcrossDpSideStream(unittest.TestCase):
             cudagraph_mode=CUDAGraphMode.FULL,
             allow_dp_padding=True,
         )
-        (max_tokens, _, synced_mode), all_reduce, stream_cls = self._run_side_stream(
+        (max_tokens, _, synced_mode), all_reduce, stream_cls, _ = self._run_side_stream(
             runner,
             self.REDUCED_MIN_MODE,
             num_tokens=8,

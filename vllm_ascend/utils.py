@@ -1151,24 +1151,25 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     a non-zero global_bs and must NOT receive mc2_mask. MegaMoE requires
     uniform token counts across ranks, so its FUSED_MC2 path cannot skip.
 
-    Returns False when hierarchy comm is enabled because hierarchy requires
-    global_bs=0 (uniform tokens), which is incompatible with skipping allreduce.
+    MoE contexts return False when hierarchy comm is enabled because hierarchy
+    requires global_bs=0 (uniform tokens). Dense targets and dense drafters have
+    no MoE dispatch/combine and skip before applying that MoE-only restriction.
 
     Recomputed per call (no memoization): potential_max_tokens is a set/get global
     computed once in init, and select_moe_comm_method is just config lookups, so
     this is cheap and avoids id-reuse / stale-cache / init-ordering hazards.
     """
     ascend_config = get_ascend_config()
-    # When mc2_comm_alg == "hierarchy", dispatch/combine op don't support dynamic global_bs,
-    # we need to do allreduce and pad token across dp every step.
-    if ascend_config.get_mc2_comm_alg() == "hierarchy":
-        return False
-
-    # For dense models, since we don't actually need dp communication, we simply skip it.
-    # This usually happens when main model is moe while eagle draft model is dense.
+    # Dense models do not run MoE dispatch/combine. This also applies when a
+    # dense drafter inherits the target model's hierarchy communication config.
     is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
     if not is_context_moe_model:
         return True
+
+    # Hierarchical MoE dispatch/combine cannot use dynamic global_bs, so MoE
+    # contexts still need the all-reduce and uniform token padding every step.
+    if ascend_config.get_mc2_comm_alg() == "hierarchy":
+        return False
 
     # Only applicable to MoE models on KV consumer ranks.
     is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
