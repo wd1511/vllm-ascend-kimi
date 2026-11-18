@@ -1,9 +1,30 @@
-# 0.30.0 官方原版
+# 0.30.0-v1.0 PR12_仅SiTU
 
-本分支的源码来自 vLLM Ascend 官方发布分支 `releases/v0.30.0`，基线提交是 `4e4c9cbaa6aa083775b5e30b2643e628037f8c04`。安装环境、依赖和构建方式见上游文档。
+保留共享专家 BF16 sparse SiTU、符合条件的 A5 未量化路由专家 sparse SiTU，以及 W4A8MXFP 路由专家 grouped SiTU。A5 TopK 直接使用注册的 NPU 算子，避免 recipes 导入后覆盖 Python 别名。
 
-- [安装指南](docs/source/getting_started/installation.md)
-- [上游发布分支](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.30.0)
-- [上游提交](https://github.com/vllm-project/vllm-ascend/commit/4e4c9cbaa6aa083775b5e30b2643e628037f8c04)
+源码基于 `f89e5592d6fbcb36ee8ce0e538d23f0dd8f951b8`，按工作区 `PR12_仅SiTU` 交付补丁重建。SiTU 的实现来源见 [cann-framework/vllm-ascend PR12](https://github.com/cann-framework/vllm-ascend/pull/12)。
 
-用于对照同版本的 Kimi 优化分支。比较源码时可运行 `git diff 0.30.0 <目标分支> -- vllm_ascend`。
+## 配置
+
+建议在同一组 MoE 运行参数上比较原版和本分支。比较 SiTU 效果时，保持共享专家多流和 Fused MC2 关闭。
+
+将下列字段并入现有的 `--additional-config`。
+
+```json
+{
+  "multistream_overlap_shared_expert": false,
+  "enable_fused_mc2": 0
+}
+```
+
+在各模型 worker 环境中安装匹配的 recipes `custom_ops` 扩展和 CANN 算子包。图模式还需要配套的图转换器。算子缺失时按原生路径执行。运行后检查注册和实际选用的算子。
+
+## 验证
+
+已对照原交付清单核验 9 个文件，运行了 7 项隔离 CPU 回归。完整仓库测试、Ascend NPU 精度和性能验证尚未运行。
+
+在源码根目录运行本分支的隔离 CPU 回归。
+
+```bash
+python tests/ut/ops/test_kimi_situ.py
+```

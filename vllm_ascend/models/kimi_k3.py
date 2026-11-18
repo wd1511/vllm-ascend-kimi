@@ -88,9 +88,11 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
+from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
@@ -360,6 +362,11 @@ class AscendKimiMoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         activation_situ_beta = config.activation_situ_beta if config.hidden_act == "situ" else None
         activation_situ_linear_beta = config.activation_situ_linear_beta if config.hidden_act == "situ" else None
+        use_recipes_situ = config.hidden_act == "situ" and get_current_hardware_profile().supports(
+            HardwareCapability.CANN_MEGAMOE_MXFP
+        )
+        if use_recipes_situ:
+            initialize_kimi_situ_ops()
 
         self.gate = GateLinear(
             input_size=hidden_size,
@@ -381,6 +388,15 @@ class AscendKimiMoE(nn.Module):
                 activation_situ_beta=activation_situ_beta,
                 activation_situ_linear_beta=activation_situ_linear_beta,
             )
+            if (
+                use_recipes_situ
+                and activation_situ_linear_beta is not None
+                and hasattr(torch.ops.custom, "npu_situ_and_mul_sparse")
+            ):
+                self.shared_experts.act_fn = AscendSharedSparseSituAndMul(
+                    self.shared_experts.act_fn.beta,
+                    self.shared_experts.act_fn.linear_beta,
+                )
         else:
             self.shared_experts = None
 
