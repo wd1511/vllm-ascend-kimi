@@ -827,18 +827,16 @@ class NPUModelRunner(GPUModelRunner):
         execute as soon as the peer DP rank arrives, instead of queueing
         behind the compute-stream backlog. Under async scheduling this turns
         the per-step host wait from "previous step fully drains" into "the
-        24-byte exchange completes". Every rank issues DP-group collectives
+        metadata exchange completes" (8 * dp_size bytes, plus peer/communicator
+        queueing). Every rank issues DP-group collectives
         in the same program order from the same worker thread, so collective
         matching across ranks is preserved.
         """
         if self._dp_metadata_stream is None:
-            self._dp_metadata_stream = torch.npu.Stream()
+            self._dp_metadata_stream = torch.npu.Stream(device=self.device)
             self._dp_metadata_event = torch.npu.Event()
-            self._dp_metadata_pinned = torch.zeros(
+            self._dp_metadata_pinned = torch.empty(
                 2, self.dp_size, dtype=torch.int32, pin_memory=self.pin_memory
-            )
-            self._dp_metadata_device = torch.zeros(
-                2, self.dp_size, dtype=torch.int32, device=self.device
             )
         pinned = self._dp_metadata_pinned
         # The previous exchange was synchronized before its caller returned,
@@ -847,6 +845,13 @@ class NPUModelRunner(GPUModelRunner):
         pinned[0][self.dp_rank] = num_tokens
         pinned[1][self.dp_rank] = cudagraph_mode.value
         with torch.npu.stream(self._dp_metadata_stream):
+            if self._dp_metadata_device is None:
+                # Allocate on the stream that owns all uses of this buffer.
+                # H2D overwrites every element, so no compute-stream zero or
+                # cross-stream allocator dependency is needed.
+                self._dp_metadata_device = torch.empty(
+                    2, self.dp_size, dtype=torch.int32, device=self.device
+                )
             self._dp_metadata_device.copy_(pinned, non_blocking=True)
             dist.all_reduce(self._dp_metadata_device, group=get_dp_group().device_group)
             pinned.copy_(self._dp_metadata_device, non_blocking=True)
@@ -1005,6 +1010,43 @@ class NPUModelRunner(GPUModelRunner):
         else:
             accepted[:num_reqs].fill(1)
         self.input_batch.num_accepted_tokens_cpu[:num_reqs] = accepted[:num_reqs]
+
+    def _publish_num_accepted_tokens_before_mamba(self, num_reqs: int) -> None:
+        """Wait for the previous snapshot only when its CPU consumer needs it.
+
+        Keep this separate from GPU input preparation: a device-side event
+        wait protects shared GPU storage there, while this host wait makes the
+        D2H snapshot safe to read and remap. Runners that publish during their
+        own input preparation override this hook to avoid remapping twice.
+        """
+        if self.num_accepted_tokens_event is not None:
+            self.num_accepted_tokens_event.synchronize()
+            self._sync_num_accepted_tokens(
+                num_reqs, has_prev_mapping=bool(self.input_batch.prev_req_id_to_index)
+            )
+            self.num_accepted_tokens.np[num_reqs:].fill(1)
+            self.num_accepted_tokens.copy_to_gpu()
+        else:
+            self.num_accepted_tokens.np.fill(1)
+            self.num_accepted_tokens.gpu.fill_(1)
+
+    def _update_num_computed_tokens_for_async_batch(
+        self, num_reqs: int, computed_token_tensor_cpu: torch.Tensor
+    ) -> None:
+        """Protect the accepted-count buffer before correcting async inputs."""
+        if self.num_accepted_tokens_event is not None:
+            # The previous step can still read/write accepted counts on
+            # global_stream(). Order this GPU overwrite after its completion
+            # without blocking the host while independent input prep runs.
+            torch.npu.current_stream().wait_event(self.num_accepted_tokens_event)
+        update_num_computed_tokens_for_batch_change(
+            self.num_computed_tokens,
+            self.num_accepted_tokens.gpu[:num_reqs],
+            self.prev_positions.gpu[:num_reqs],
+            self.valid_sampled_token_count_gpu,
+            self.prev_num_draft_tokens.gpu,
+            computed_token_tensor_cpu,
+        )
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -1444,10 +1486,10 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # NOTE: The num_accepted_tokens event sync/publish intentionally lives
-        # in execute_model right before the mamba block, not here: everything
-        # between this point and the mamba bookkeeping is independent of the
-        # accepted counts, so deferring the wait lets it overlap with the
-        # previous step's remaining execution instead of stalling input prep.
+        # in execute_model right before the mamba block. GPU input correction
+        # below still reuses accepted-count storage, so it establishes a
+        # device-side event dependency before writing that storage. The host
+        # can continue preparing inputs until it needs the CPU snapshot.
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
@@ -1466,14 +1508,7 @@ class NPUModelRunner(GPUModelRunner):
             if prev_positions_gpu is None:
                 self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
-            update_num_computed_tokens_for_batch_change(
-                self.num_computed_tokens,
-                self.num_accepted_tokens.gpu[:num_reqs],
-                self.prev_positions.gpu[:num_reqs],
-                valid_sampled_token_count_gpu,
-                self.prev_num_draft_tokens.gpu,
-                computed_token_tensor_cpu,
-            )
+            self._update_num_computed_tokens_for_async_batch(num_reqs, computed_token_tensor_cpu)
         else:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
@@ -2361,22 +2396,11 @@ class NPUModelRunner(GPUModelRunner):
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-                # Sync num_accepted_tokens from CPU (set by
-                # _update_states_after_model_execute for hybrid models).
-                # Placed here, immediately before its only CPU consumer
-                # (preprocess_mamba), so the wait overlaps with the previous
-                # step's remaining execution; the independent input-prep work
-                # in _prepare_inputs above already ran while waiting.
-                if self.num_accepted_tokens_event is not None:
-                    self.num_accepted_tokens_event.synchronize()
-                    self._sync_num_accepted_tokens(
-                        num_reqs, has_prev_mapping=bool(self.input_batch.prev_req_id_to_index)
-                    )
-                    self.num_accepted_tokens.np[num_reqs:].fill(1)
-                    self.num_accepted_tokens.copy_to_gpu()
-                else:
-                    self.num_accepted_tokens.np.fill(1)
-                    self.num_accepted_tokens.gpu.fill_(1)
+                # Publish the completed snapshot immediately before Mamba's
+                # CPU bookkeeping. 310P publishes in its own _prepare_inputs
+                # and overrides this hook, so previous-to-current row mapping
+                # is applied exactly once per step.
+                self._publish_num_accepted_tokens_before_mamba(num_reqs)
 
                 # postprocess_mamba runs later in _update_states_after_model_execute.
                 if self.cache_config.mamba_cache_mode == "align":

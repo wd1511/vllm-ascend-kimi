@@ -72,11 +72,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to run the DP metadata all-reduce on the default compute stream
-    # with a blocking D2H copy (legacy behavior). Default False: the 24-byte
+    # with a blocking D2H copy (legacy behavior). Default False: the 8 * DP-size byte
     # exchange (num_tokens + cudagraph_mode across DP ranks) is issued on a
-    # dedicated side stream and the host only waits for the tiny collective
-    # instead of the compute-stream backlog, removing a per-step host stream
-    # sync under async scheduling. Set to "1" to restore the legacy
+    # dedicated side stream. The host still waits for that exchange, including
+    # peer/communicator queueing, without depending on the compute-stream backlog.
+    # Set to "1" to restore the legacy
     # compute-stream path if HCCL cross-stream ordering issues are suspected.
     # Valid values: "0" (default) or "1". Sensitive: No.
     "VLLM_ASCEND_DP_METADATA_ALLREDUCE_ON_COMPUTE_STREAM": lambda: bool(

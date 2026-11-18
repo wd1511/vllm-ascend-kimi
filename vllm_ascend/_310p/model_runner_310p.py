@@ -248,6 +248,15 @@ class NPUModelRunner310(NPUModelRunner):
             self.attn_state = attn_state
         return attn_state
 
+    def _publish_num_accepted_tokens_before_mamba(self, num_reqs: int) -> None:
+        """310P already publishes accepted counts in its input preparation.
+
+        Reapplying the previous-to-current mapping here would corrupt counts
+        after a reorder or compaction. Keep the early 310P path, including its
+        RC-device initialization, as the single owner of that publication.
+        """
+        return
+
     def _prepare_inputs(  # type: ignore[override]
         self,
         scheduler_output: SchedulerOutput,
