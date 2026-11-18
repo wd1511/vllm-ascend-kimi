@@ -52,6 +52,8 @@ def apply_moe_mlp(
         hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
     else:
         hidden_states = quant_method.apply_gmm1(mlp_compute_input)
+        if mlp_compute_input.shared_expert_schedule is not None:
+            mlp_compute_input.shared_expert_schedule.after_gmm1()
         hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
         hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
 
@@ -67,25 +69,29 @@ def _unified_apply_activation(
 
     if activation == MoEActivation.SITU:
         beta = 1.0 if mlp_compute_input.activation_situ_beta is None else mlp_compute_input.activation_situ_beta
-        linear_beta = mlp_compute_input.activation_situ_linear_beta
+        alpha = mlp_compute_input.activation_situ_linear_beta
         if (
-            mlp_compute_input.quant.quant_type == QuantType.NONE
+            get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+            and mlp_compute_input.quant.quant_type == QuantType.NONE
             and hidden_states.dtype in (torch.float16, torch.bfloat16)
-            and hidden_states.shape[0] > 0
             and mlp_compute_input.group_list_type in (0, 1)
             and beta > 0
-            and linear_beta is not None
-            and linear_beta > 0
+            and alpha is not None
+            and alpha > 0
             and hasattr(torch.ops.custom, "npu_situ_and_mul_sparse")
-            and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
         ):
-            expert_tokens = cumsum_group_list(
-                mlp_compute_input.group_list.to(torch.int64), mlp_compute_input.group_list_type, 1
-            )
             return torch.ops.custom.npu_situ_and_mul_sparse(
-                hidden_states, expert_tokens, beta=beta, alpha=linear_beta, high_precision=True
+                hidden_states,
+                cumsum_group_list(mlp_compute_input.group_list.to(torch.int64), mlp_compute_input.group_list_type, 1),
+                beta=beta,
+                alpha=alpha,
+                high_precision=True,
             )
-        hidden_states = _apply_situ(hidden_states, beta=beta, linear_beta=linear_beta)
+        hidden_states = _apply_situ(
+            hidden_states,
+            beta=1.0 if mlp_compute_input.activation_situ_beta is None else mlp_compute_input.activation_situ_beta,
+            linear_beta=mlp_compute_input.activation_situ_linear_beta,
+        )
     elif activation == MoEActivation.SWIGLUOAI:
         w1, _ = quant_method.get_mlp_weights(mlp_compute_input.layer)
         _, _, hidden_size = w1.shape
