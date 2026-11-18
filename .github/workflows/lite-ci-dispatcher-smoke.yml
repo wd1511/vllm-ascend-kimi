@@ -41,7 +41,7 @@ jobs:
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
       native_source: ${{ steps.plan.outputs.native_source }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: cann-framework/vllm-ascend
           ref: ${{ github.workflow_sha }}
@@ -55,7 +55,7 @@ jobs:
           CI_RESOLVE_ONLY: '1'
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
       - name: Check out the tested Smoke definitions
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: cann-framework/vllm-ascend
           ref: ${{ steps.source.outputs.source_sha }}
@@ -98,7 +98,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: cann-framework/vllm-ascend
           ref: ${{ github.workflow_sha }}
@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Lite-Actions-Smoke
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.prepare.outputs.native_source == 'true'
         with:
           repository: cann-framework/vllm-ascend
@@ -136,7 +136,7 @@ jobs:
         with:
           name: lite-ci-source-${{ github.run_attempt }}
           path: .ci-source
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.prepare.outputs.native_source == 'true'
         with:
           repository: cann-framework/vllm-ascend
