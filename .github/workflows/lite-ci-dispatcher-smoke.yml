@@ -103,7 +103,7 @@ jobs:
           repository: cann-framework/vllm-ascend
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.prepare.outputs.native_source == 'true'
         with:
           name: lite-ci-source-${{ github.run_attempt }}
@@ -131,7 +131,7 @@ jobs:
           repository: cann-framework/vllm-ascend
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.prepare.outputs.native_source == 'true'
         with:
           name: lite-ci-source-${{ github.run_attempt }}
